@@ -25,6 +25,7 @@ var readerPool = sync.Pool{
 type segment struct {
 	dir    string
 	fields map[string]*fieldIndex
+	allIDs *roaring64.Bitmap // all record IDs in this segment
 }
 
 // fieldIndex holds an FST + roaring bitmaps for one field.
@@ -52,6 +53,13 @@ func openSegment(dir string, fieldNames []string) (*segment, error) {
 			seg.fields[name] = fi
 		}
 	}
+
+	// Load all-IDs bitmap if present.
+	allPath := filepath.Join(dir, "_all.roar")
+	if data, err := os.ReadFile(allPath); err == nil && len(data) > 0 {
+		seg.allIDs = decodeBitmap(data)
+	}
+
 	return seg, nil
 }
 

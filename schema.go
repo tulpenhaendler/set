@@ -125,10 +125,11 @@ func (s Schema) Hash() string {
 // MarshalJSON returns a JSON representation of the schema for on-disk storage.
 func (s Schema) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Name   string  `json:"name"`
-		Fields []Field `json:"fields"`
-		Hash   string  `json:"hash"`
-	}{s.Name, s.Fields, s.Hash()})
+		Name       string      `json:"name"`
+		Fields     []Field     `json:"fields"`
+		Composites []Composite `json:"composites,omitempty"`
+		Hash       string      `json:"hash"`
+	}{s.Name, s.Fields, s.Composites, s.Hash()})
 }
 
 // Record is a map of field name → value for indexing.

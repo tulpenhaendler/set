@@ -32,7 +32,8 @@ type segmentBuilder struct {
 	dir    string
 	fields []Field
 	bufs   map[string]*fieldBuffer
-	arena  []byte // shared backing store for key copies
+	arena  []byte             // shared backing store for key copies
+	allIDs *roaring64.Bitmap  // all record IDs for Not() support
 }
 
 func newSegmentBuilder(dir string, fields []Field) *segmentBuilder {
@@ -40,7 +41,12 @@ func newSegmentBuilder(dir string, fields []Field) *segmentBuilder {
 	for _, f := range fields {
 		bufs[f.Name] = &fieldBuffer{}
 	}
-	return &segmentBuilder{dir: dir, fields: fields, bufs: bufs}
+	return &segmentBuilder{
+		dir:    dir,
+		fields: fields,
+		bufs:   bufs,
+		allIDs: roaring64.New(),
+	}
 }
 
 func (sb *segmentBuilder) add(fieldName string, key []byte, recordID uint64) {
@@ -51,6 +57,9 @@ func (sb *segmentBuilder) add(fieldName string, key []byte, recordID uint64) {
 		key:      sb.arena[start:len(sb.arena):len(sb.arena)],
 		recordID: recordID,
 	})
+	if sb.allIDs != nil {
+		sb.allIDs.Add(recordID)
+	}
 }
 
 func (sb *segmentBuilder) build() error {
@@ -67,6 +76,26 @@ func (sb *segmentBuilder) build() error {
 			return fmt.Errorf("fst: build field %q: %w", f.Name, err)
 		}
 	}
+
+	// Write all-IDs bitmap for efficient Not() queries.
+	if sb.allIDs != nil && !sb.allIDs.IsEmpty() {
+		sb.allIDs.RunOptimize()
+		allPath := filepath.Join(sb.dir, "_all.roar")
+		f, err := os.Create(allPath)
+		if err != nil {
+			return fmt.Errorf("fst: create all-ids: %w", err)
+		}
+		if _, err := sb.allIDs.WriteTo(f); err != nil {
+			f.Close()
+			return fmt.Errorf("fst: write all-ids: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("fst: fsync all-ids: %w", err)
+		}
+		f.Close()
+	}
+
 	return nil
 }
 

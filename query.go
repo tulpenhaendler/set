@@ -486,8 +486,13 @@ func (q *notQuery) eval(r *Repo) *roaring64.Bitmap {
 	inner := q.inner.eval(r)
 	all := roaring64.New()
 	for _, seg := range r.segments {
-		for _, fi := range seg.fields {
-			fi.lookupAll(all)
+		if seg.allIDs != nil {
+			all.Or(seg.allIDs)
+		} else {
+			// Fallback for segments built before allIDs was added.
+			for _, fi := range seg.fields {
+				fi.lookupAll(all)
+			}
 		}
 	}
 	all.AndNot(inner)

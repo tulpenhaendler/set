@@ -1,6 +1,6 @@
 # set
 
-A bitmap index engine for querying large sets of blockchain data. Built for workloads where you index once and query many times -- transactions, operations, events, token transfers.
+A secondary index engine for querying large sets of blockchain data. Returns matching record IDs, not row data -- pair it with your own storage for payloads.
 
 Given a schema of typed fields, `set` builds [FST](https://en.wikipedia.org/wiki/Finite-state_transducer)-backed inverted indexes with [roaring bitmaps](https://roaringbitmap.org/) and answers set queries (equality, range, intersection, union) over millions of records in microseconds.
 
