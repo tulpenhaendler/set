@@ -230,6 +230,8 @@ func (r *Repo) Flush() error {
 		r.mu.Unlock()
 		return err
 	}
+	// Ensure segment directory and its parent entry are durable.
+	syncDir(segDir)
 	syncDir(filepath.Dir(segDir))
 
 	fieldNames := allFieldNames(r.schema)
@@ -243,9 +245,11 @@ func (r *Repo) Flush() error {
 		return err
 	}
 
+	// Clear flushing BEFORE appending segment to avoid a window where
+	// a concurrent query sees both the flushing buffer and the new segment.
 	r.mu.Lock()
-	r.segments = append(r.segments, seg)
 	r.flushing = nil
+	r.segments = append(r.segments, seg)
 	r.mu.Unlock()
 
 	return nil
@@ -309,6 +313,9 @@ func (r *Repo) compactOnce() (bool, error) {
 }
 
 // mergeSegments merges the given segments into a single new segment.
+// Concurrency: mu is held briefly to grab nextSeg and again to swap segments.
+// Between those sections, Flush() may append new segments -- these are not in
+// mergeSet and are preserved in kept. compactMu serializes Compact() calls.
 func (r *Repo) mergeSegments(toMerge []*segment) error {
 	r.mu.Lock()
 	segNum := r.nextSeg

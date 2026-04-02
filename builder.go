@@ -125,7 +125,18 @@ func writeSegmentChecksum(dir string) error {
 	}
 	var buf [4]byte
 	binary.LittleEndian.PutUint32(buf[:], h.Sum32())
-	return os.WriteFile(filepath.Join(dir, "checksum"), buf[:], 0644)
+	p := filepath.Join(dir, "checksum")
+	if err := os.WriteFile(p, buf[:], 0644); err != nil {
+		return err
+	}
+	// fsync the checksum file so it's durable before we return.
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	f.Close()
+	return err
 }
 
 func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {

@@ -159,3 +159,4 @@ FST prefix compression with varint-encoded transitions and roaring run-length en
 - **Not() is universe-scoped.** It computes the full record set per segment (via precomputed allIDs bitmaps, O(segments) not O(postings)), then subtracts. Best used inside `And(selective_predicate, Not(x))` where the intersection short-circuits early.
 - **No value-ordered iteration.** Results are returned in ascending record ID order, not sorted by any field value. For ordered output (e.g. "by level"), sort the IDs after fetching payloads.
 - **Benchmarks measure index lookup only.** End-to-end query latency includes the payload fetch from your storage layer, which is not measured here.
+- **In-memory buffer is scanned linearly.** Queries scan unflushed records with no index. Flush frequently to keep the buffer small.
