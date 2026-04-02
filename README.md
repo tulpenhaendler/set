@@ -21,7 +21,7 @@ Blockchain data is immutable. By dropping the mutability requirement, `set` uses
 | Disk | 78 MB | 265 MB | **3.4x smaller** |
 | Total write | 2.1 s | 1.6 s | SQLite 1.3x faster |
 
-The advantage grows with data size. Bitmap operations scale linearly with set bits, while B-tree traversal adds per-row overhead. At 10M+ records, expect the query gap to widen further.
+This is a quick benchmark indicative of the performance difference between bitmap indexes and a naive SQLite implementation for this specific use case -- append-only data with filter-heavy read queries. It is not a comprehensive comparison against tuned database deployments.
 
 Reproduce with `go run ./cmd/bench_compare` (requires `test_data/tezos_txs.jsonl`).
 

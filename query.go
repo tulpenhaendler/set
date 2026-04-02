@@ -564,9 +564,9 @@ func (r *Repo) encodeQueryValue(fieldName string, value any) []byte {
 	return nil
 }
 
-// evalBuffer scans the in-memory buffer for matches.
+// evalBuffer scans the in-memory buffer and flushing buffer for matches.
 func (r *Repo) evalBuffer(q Query) *roaring64.Bitmap {
-	if len(r.buffer) == 0 {
+	if len(r.buffer) == 0 && len(r.flushing) == 0 {
 		return nil
 	}
 	return evalBufferQuery(r, q)
@@ -647,6 +647,9 @@ func evalBufferQuery(r *Repo, q Query) *roaring64.Bitmap {
 		for _, br := range r.buffer {
 			all.Add(br.id)
 		}
+		for _, br := range r.flushing {
+			all.Add(br.id)
+		}
 		all.AndNot(inner)
 		return all
 	}
@@ -660,17 +663,20 @@ func scanBuffer(r *Repo, fieldName string, match func([]byte) bool) *roaring64.B
 	}
 	bm := roaring64.New()
 	isSlice := idx < r.nFields && r.schema.Fields[idx].Type.Kind == KindSlice
-	for _, br := range r.buffer {
-		if isSlice {
-			for _, key := range br.slices[idx] {
+	// Scan both the active buffer and any buffer being flushed.
+	for _, buf := range [2][]bufferedRecord{r.buffer, r.flushing} {
+		for _, br := range buf {
+			if isSlice {
+				for _, key := range br.slices[idx] {
+					if match(key) {
+						bm.Add(br.id)
+						break
+					}
+				}
+			} else if key := br.keys[idx]; key != nil {
 				if match(key) {
 					bm.Add(br.id)
-					break
 				}
-			}
-		} else if key := br.keys[idx]; key != nil {
-			if match(key) {
-				bm.Add(br.id)
 			}
 		}
 	}

@@ -30,6 +30,7 @@ type Repo struct {
 	segments  []*segment
 	nextSeg   int
 	buffer    []bufferedRecord
+	flushing  []bufferedRecord // buffer being flushed, visible to queries until segment is live
 	compactMu sync.Mutex
 
 	// Pre-computed field layout.
@@ -171,10 +172,12 @@ func (r *Repo) BatchIndex(ids []uint64, recs []Record) error {
 }
 
 // Flush writes the in-memory buffer to a new immutable segment.
+// Records remain visible to queries throughout the flush.
 func (r *Repo) Flush() error {
 	r.mu.Lock()
 	buf := r.buffer
 	r.buffer = nil
+	r.flushing = buf // keep visible to queries during build
 	segNum := r.nextSeg
 	r.nextSeg++
 	r.mu.Unlock()
@@ -215,6 +218,7 @@ func (r *Repo) Flush() error {
 
 	r.mu.Lock()
 	r.segments = append(r.segments, seg)
+	r.flushing = nil // segment is live, stop scanning flushing buffer
 	r.mu.Unlock()
 
 	return nil
