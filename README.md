@@ -6,15 +6,9 @@ Given a schema of typed fields, `set` builds [FST](https://en.wikipedia.org/wiki
 
 ## Why not a database?
 
-General-purpose databases are designed for mutable, row-oriented workloads. Blockchain data is different: it's append-only, immutable, and queried far more than it's written. `set` is built for exactly this access pattern.
+Databases use B-trees, which are optimized for mutable data -- random inserts, updates, deletes. That flexibility costs: queries walk leaf pages row by row, and multi-column intersections require index merges.
 
-**SQLite / Postgres** store rows in B-trees. When a query matches thousands of records, the engine walks leaf pages and deserializes each row. Index merges for multi-column queries add further overhead. `set` stores compressed bitmap sets -- an `And` of two predicates is a CPU-level bitwise AND over compact bitsets, not a merge join. The result is 3-20x faster queries at 2.5x less disk.
-
-**Cassandra / ScyllaDB** are built for distributed writes and partition-key lookups. They're fast at "get all rows for partition X" but poor at ad-hoc intersection queries ("sender=X AND level BETWEEN Y AND Z") because that requires cross-partition scatter-gather. `set` answers these queries locally with bitmap ops in microseconds.
-
-**Elasticsearch** supports bitmap-like operations internally but carries enormous operational overhead -- JVM tuning, cluster management, shard rebalancing. For a single-node indexer processing blockchain data, it's the wrong tool.
-
-The tradeoff is write speed. Building an FST is more expensive than inserting into a B-tree, though the gap is small (~1.3x). For blockchain data this is the right tradeoff: blocks are immutable, data is append-only, and reads vastly outnumber writes. You flush once per batch of blocks and query constantly.
+Blockchain data is immutable. By dropping the mutability requirement, `set` uses compressed bitmap indexes instead: an `And` of two predicates is a CPU-level bitwise AND over compact bitsets, not a merge join. The tradeoff is slower writes (~1.3x vs SQLite), which is fine when reads outnumber writes 1000:1.
 
 ### Benchmark: 500k Tezos transactions
 
