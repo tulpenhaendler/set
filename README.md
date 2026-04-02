@@ -21,11 +21,11 @@ The tradeoff is write speed. Building an FST is more expensive than inserting in
 | Query | FST | SQLite | Speedup |
 |---|---|---|---|
 | Eq(sender) | 1.1 ms | 18.8 ms | **17x** |
-| And(sender,target) | 2.6 us | 6.7 us | **2.5x** |
-| Range(level) | 138 us | 2.9 ms | **21x** |
+| And(sender,target) | 2.6 us | 7.1 us | **2.7x** |
+| Range(level) | 136 us | 2.9 ms | **21x** |
 | And(sender,range) | 727 us | 1.9 ms | **2.6x** |
-| Disk | 81 MB | 265 MB | **3.3x smaller** |
-| Total write | 2.0 s | 1.6 s | SQLite 1.3x faster |
+| Disk | 78 MB | 265 MB | **3.4x smaller** |
+| Total write | 2.1 s | 1.6 s | SQLite 1.3x faster |
 
 The advantage grows with data size. Bitmap operations scale linearly with set bits, while B-tree traversal adds per-row overhead. At 10M+ records, expect the query gap to widen further.
 

@@ -114,8 +114,8 @@ func benchFST(dir string, txs []Transaction, hotSender, hotTarget string, rangeL
 	repo, err := store.Repo(set.Schema{
 		Name: "transactions",
 		Fields: []set.Field{
-			{Name: "sender", Type: set.String(dict.KeyRaw)},
-			{Name: "target", Type: set.String(dict.KeyRaw)},
+			{Name: "sender", Type: set.String(dict.KeyTezosAddress)},
+			{Name: "target", Type: set.String(dict.KeyTezosAddress)},
 			{Name: "level", Type: set.Range(set.Uint64BE)},
 			{Name: "status", Type: set.Enum("applied", "failed", "backtracked", "skipped")},
 		},
