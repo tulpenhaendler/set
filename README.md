@@ -33,12 +33,13 @@ import (
     "github.com/tulpenhaendler/dict"
 )
 
-// Open a store (creates directory if needed).
-store, _ := set.Open("/path/to/index")
+store, err := set.Open("/path/to/index")
+if err != nil {
+    log.Fatal(err)
+}
 defer store.Close()
 
-// Define a schema.
-repo, _ := store.Repo(set.Schema{
+repo, err := store.Repo(set.Schema{
     Name: "transactions",
     Fields: []set.Field{
         {Name: "sender", Type: set.String(dict.KeyRaw)},
@@ -47,17 +48,24 @@ repo, _ := store.Repo(set.Schema{
         {Name: "status", Type: set.Enum("applied", "failed", "backtracked")},
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 
 // Index records into an in-memory buffer.
-repo.Index(0, set.Record{
+if err := repo.Index(0, set.Record{
     "sender": "tz1abc...",
     "target": "tz1def...",
     "level":  uint64(4_500_000),
     "status": "applied",
-})
+}); err != nil {
+    log.Fatal(err)
+}
 
 // Flush the buffer to an immutable on-disk segment.
-repo.Flush()
+if err := repo.Flush(); err != nil {
+    log.Fatal(err)
+}
 
 // Query.
 iter := repo.Query(set.And(
@@ -139,6 +147,10 @@ Compact() → merge similar-sized segments (size-tiered)
 ```
 
 Flush when you've accumulated a batch (e.g. every N blocks). Compact periodically to reduce the number of segments. Queries work across all segments and the in-memory buffer transparently -- records remain visible even during an in-progress flush.
+
+**Compact behavior:** Size-tiered -- segments are grouped by record count, and only tiers with 4+ segments are merged. Reads are never blocked. The result is a bounded number of segments (~3 per size tier) without rewriting the entire dataset.
+
+**Crash safety:** All segment files are fsynced before the segment is made visible. If Flush() fails mid-write, the buffer is restored and the partial segment is cleaned up. Compaction uses a marker file to track which old segments to delete; incomplete compactions are recovered on next open. Each segment includes a CRC32 checksum verified at load time -- corrupted segments are skipped.
 
 ## Storage
 
