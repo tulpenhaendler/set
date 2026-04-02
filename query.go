@@ -113,6 +113,9 @@ func Or(queries ...Query) Query {
 }
 
 // Not creates a negation query.
+// Cost is proportional to total record count (computes universe via allIDs bitmaps),
+// not the selectivity of the inner predicate. Best used in And(selective, Not(x))
+// where the And short-circuits on the selective predicate first.
 func Not(query Query) Query {
 	return &notQuery{inner: query}
 }
@@ -311,11 +314,16 @@ func estimateRange(r *Repo, field string, from, to []byte) uint64 {
 		}
 		it := fi.fst.Iterator(from, to)
 		for it.Next() {
-			size := fi.estimateBitmapSize(uint32(it.Value()))
-			if size <= 24 {
-				est++
+			idx := uint32(it.Value())
+			if bm, ok := fi.cache.Get(idx); ok {
+				est += bm.GetCardinality()
 			} else {
-				est += uint64(size-24) / 2
+				size := fi.estimateBitmapSize(idx)
+				if size <= 24 {
+					est++
+				} else {
+					est += uint64(size) / 4
+				}
 			}
 		}
 	}

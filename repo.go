@@ -127,6 +127,8 @@ func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
 }
 
 // Index adds a record to the in-memory buffer.
+// Each ID must be unique across all Index calls for this repo.
+// Duplicate IDs are not detected and will cause incorrect query results.
 func (r *Repo) Index(id uint64, rec Record) error {
 	if err := r.schema.ValidateRecord(rec); err != nil {
 		return err
@@ -222,13 +224,13 @@ func (r *Repo) Flush() error {
 
 	if err := sb.build(); err != nil {
 		os.RemoveAll(segDir)
-		// Restore buffer so records aren't lost.
 		r.mu.Lock()
 		r.buffer = append(buf, r.buffer...)
 		r.flushing = nil
 		r.mu.Unlock()
 		return err
 	}
+	syncDir(filepath.Dir(segDir))
 
 	fieldNames := allFieldNames(r.schema)
 	seg, err := openSegment(segDir, fieldNames)

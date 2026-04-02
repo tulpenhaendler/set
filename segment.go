@@ -227,15 +227,23 @@ func (fi *fieldIndex) lookupAll(dst *roaring64.Bitmap) {
 }
 
 // estimateEq returns estimated cardinality by summing bucket bitmap sizes.
+// Uses exact cardinality for cached bitmaps, byte-size heuristic otherwise.
 func (fi *fieldIndex) estimateEq(valueKey []byte) uint64 {
 	var est uint64
 	it := fi.fst.IteratorPrefix(valueKey)
 	for it.Next() {
-		size := fi.estimateBitmapSize(uint32(it.Value()))
-		if size <= 24 {
-			est += 1
+		idx := uint32(it.Value())
+		if bm, ok := fi.cache.Get(idx); ok {
+			est += bm.GetCardinality()
 		} else {
-			est += uint64(size-24) / 2
+			size := fi.estimateBitmapSize(idx)
+			if size <= 24 {
+				est++
+			} else {
+				// Rough heuristic: roaring uses ~2 bytes per ID in mixed mode,
+				// but run-length containers can be much denser.
+				est += uint64(size) / 4
+			}
 		}
 	}
 	return est

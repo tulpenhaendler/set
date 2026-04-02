@@ -135,10 +135,10 @@ result  := store.Intersect(txIter, tagIter)
 ```
 Index() → buffer in memory (fast, ~1.8M records/sec)
 Flush() → write buffer to immutable segment on disk
-Compact() → merge all segments into one
+Compact() → merge similar-sized segments (size-tiered)
 ```
 
-Flush when you've accumulated a batch (e.g. every N blocks). Compact periodically to reduce the number of segments and reclaim space. Queries work across all segments and the in-memory buffer transparently.
+Flush when you've accumulated a batch (e.g. every N blocks). Compact periodically to reduce the number of segments. Queries work across all segments and the in-memory buffer transparently -- records remain visible even during an in-progress flush.
 
 ## Storage
 
@@ -149,3 +149,13 @@ On-disk format per field:
 - `.roar` -- concatenated roaring bitmap data with an offset table
 
 FST prefix compression with varint-encoded transitions and roaring run-length encoding typically achieve 3x smaller indexes compared to equivalent B-tree indexes.
+
+## Limitations
+
+- **Returns IDs only.** This is a secondary index, not a database. Pair it with your own storage for row data.
+- **Record IDs must be unique.** Indexing the same ID twice is not detected and will cause incorrect results after compaction. For blockchain data, use sequential IDs or block-scoped counters.
+- **Schema is fixed at repo creation.** Adding or removing fields requires re-indexing. There is no migration path.
+- **Cross-repo queries require shared IDs.** The [dict](https://github.com/tulpenhaendler/dict) package provides dictionary-assigned IDs for string values (transaction hashes, addresses). If you assign your own numeric IDs, cross-repo intersection works without dict.
+- **Not() is universe-scoped.** It computes the full record set per segment (via precomputed allIDs bitmaps, O(segments) not O(postings)), then subtracts. Best used inside `And(selective_predicate, Not(x))` where the intersection short-circuits early.
+- **No value-ordered iteration.** Results are returned in ascending record ID order, not sorted by any field value. For ordered output (e.g. "by level"), sort the IDs after fetching payloads.
+- **Benchmarks measure index lookup only.** End-to-end query latency includes the payload fetch from your storage layer, which is not measured here.
