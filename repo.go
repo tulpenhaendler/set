@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,16 +15,22 @@ import (
 	"github.com/tulpenhaendler/dict"
 )
 
+const (
+	compactMinMerge = 4 // merge when a tier has this many segments
+	compactTierBits = 2 // bits per tier (base-4: tiers 0-3, 4-15, 16-63, ...)
+)
+
 // Repo is an index repository with a fixed schema.
 type Repo struct {
 	dir    string
 	schema Schema
 	dict   *dict.Dict
 
-	mu       sync.RWMutex
-	segments []*segment
-	nextSeg  int
-	buffer   []bufferedRecord
+	mu        sync.RWMutex
+	segments  []*segment
+	nextSeg   int
+	buffer    []bufferedRecord
+	compactMu sync.Mutex
 
 	// Pre-computed field layout.
 	fieldMap map[string]int // field name → index (includes composites)
@@ -213,14 +220,66 @@ func (r *Repo) Flush() error {
 	return nil
 }
 
-// Compact merges all segments into a single segment.
-func (r *Repo) Compact() error {
-	r.mu.Lock()
-	if len(r.segments) <= 1 {
-		r.mu.Unlock()
-		return nil
+// segmentTier returns the size tier for a segment with n records.
+// Base-4 tiers: 0=1-3, 1=4-15, 2=16-63, etc.
+func segmentTier(n uint64) int {
+	if n <= 1 {
+		return 0
 	}
+	return bits.Len64(n-1) / compactTierBits
+}
+
+// Compact runs size-tiered compaction: merges segments of similar size
+// until no tier has more than compactMinMerge segments.
+func (r *Repo) Compact() error {
+	r.compactMu.Lock()
+	defer r.compactMu.Unlock()
+
+	for {
+		merged, err := r.compactOnce()
+		if err != nil {
+			return err
+		}
+		if !merged {
+			return nil
+		}
+	}
+}
+
+// compactOnce finds the lowest tier with >= compactMinMerge segments and merges them.
+func (r *Repo) compactOnce() (bool, error) {
+	r.mu.RLock()
 	segs := r.segments
+	r.mu.RUnlock()
+
+	if len(segs) < compactMinMerge {
+		return false, nil
+	}
+
+	// Group segments by tier.
+	tiers := map[int][]*segment{}
+	for _, seg := range segs {
+		t := segmentTier(seg.size())
+		tiers[t] = append(tiers[t], seg)
+	}
+
+	// Find lowest tier with enough segments to merge.
+	bestTier := -1
+	for t, group := range tiers {
+		if len(group) >= compactMinMerge && (bestTier < 0 || t < bestTier) {
+			bestTier = t
+		}
+	}
+	if bestTier < 0 {
+		return false, nil
+	}
+
+	return true, r.mergeSegments(tiers[bestTier])
+}
+
+// mergeSegments merges the given segments into a single new segment.
+func (r *Repo) mergeSegments(toMerge []*segment) error {
+	r.mu.Lock()
 	segNum := r.nextSeg
 	r.nextSeg++
 	r.mu.Unlock()
@@ -230,7 +289,7 @@ func (r *Repo) Compact() error {
 	sb := newSegmentBuilder(segDir, allF)
 
 	for _, f := range allF {
-		for _, seg := range segs {
+		for _, seg := range toMerge {
 			fi := seg.fields[f.Name]
 			if fi == nil {
 				continue
@@ -240,8 +299,7 @@ func (r *Repo) Compact() error {
 				bm := fi.loadBitmap(uint32(it.Value()))
 				bmIt := bm.Iterator()
 				for bmIt.HasNext() {
-					recordID := bmIt.Next()
-					sb.add(f.Name, it.Key(), recordID)
+					sb.add(f.Name, it.Key(), bmIt.Next())
 				}
 			}
 		}
@@ -259,11 +317,10 @@ func (r *Repo) Compact() error {
 		return fmt.Errorf("fst: compact open: %w", err)
 	}
 
-	// Write marker listing old segments to remove.
-	// If we crash after this, recovery cleans them up on next open.
+	// Write marker listing segments to remove.
 	segBase := filepath.Join(r.dir, "segments")
 	var marker []byte
-	for _, seg := range segs {
+	for _, seg := range toMerge {
 		marker = append(marker, []byte(filepath.Base(seg.dir)+"\n")...)
 	}
 	markerPath := filepath.Join(segBase, ".compact_done")
@@ -272,14 +329,23 @@ func (r *Repo) Compact() error {
 	}
 	syncDir(segBase)
 
-	// Swap segments.
+	// Swap: remove merged segments, add new one.
 	r.mu.Lock()
-	oldSegs := r.segments
-	r.segments = []*segment{newSeg}
+	mergeSet := make(map[*segment]bool, len(toMerge))
+	for _, s := range toMerge {
+		mergeSet[s] = true
+	}
+	kept := make([]*segment, 0, len(r.segments)-len(toMerge)+1)
+	for _, s := range r.segments {
+		if !mergeSet[s] {
+			kept = append(kept, s)
+		}
+	}
+	kept = append(kept, newSeg)
+	r.segments = kept
 	r.mu.Unlock()
 
-	// Clean up old segments and marker.
-	for _, seg := range oldSegs {
+	for _, seg := range toMerge {
 		seg.close()
 		os.RemoveAll(seg.dir)
 	}

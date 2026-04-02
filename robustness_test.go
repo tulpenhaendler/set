@@ -1,6 +1,7 @@
 package set
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -423,4 +424,147 @@ func TestNotQueryBuffer(t *testing.T) {
 
 	iter := repo.Query(Not(Eq("color", "red")))
 	assertIDs(t, collectIDs(t, iter), []uint64{2})
+}
+
+func TestTieredCompaction(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	schema := Schema{
+		Name: "items",
+		Fields: []Field{
+			{Name: "color", Type: String(dict.KeyRaw)},
+			{Name: "size", Type: Range(Uint64BE)},
+		},
+	}
+	repo, err := store.Repo(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	segCount := func() int {
+		repo.mu.RLock()
+		defer repo.mu.RUnlock()
+		return len(repo.segments)
+	}
+
+	// Create 8 small segments (1 record each = tier 0).
+	for i := 0; i < 8; i++ {
+		repo.Index(uint64(i), Record{
+			"color": fmt.Sprintf("color_%d", i%4),
+			"size":  uint64(i),
+		})
+		repo.Flush()
+	}
+
+	if n := segCount(); n != 8 {
+		t.Fatalf("expected 8 segments before compact, got %d", n)
+	}
+
+	// Compact: 8 tier-0 segments → should merge 4, then possibly merge again.
+	if err := repo.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	n := segCount()
+	if n >= 8 {
+		t.Errorf("expected fewer than 8 segments after compact, got %d", n)
+	}
+	t.Logf("segments after first compact: %d", n)
+
+	// Verify data integrity.
+	for i := 0; i < 8; i++ {
+		count := repo.Count(Eq("size", uint64(i)))
+		if count != 1 {
+			t.Errorf("Eq(size=%d): got %d, want 1", i, count)
+		}
+	}
+	total := repo.Count(Gte("size", uint64(0)))
+	if total != 8 {
+		t.Errorf("total count = %d, want 8", total)
+	}
+
+	// Add more small segments and compact again.
+	for i := 8; i < 16; i++ {
+		repo.Index(uint64(i), Record{
+			"color": fmt.Sprintf("color_%d", i%4),
+			"size":  uint64(i),
+		})
+		repo.Flush()
+	}
+
+	if err := repo.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	n2 := segCount()
+	t.Logf("segments after second compact: %d", n2)
+
+	// All 16 records should still be queryable.
+	total = repo.Count(Gte("size", uint64(0)))
+	if total != 16 {
+		t.Errorf("total count = %d, want 16", total)
+	}
+
+	// Not query should still work across compacted segments.
+	iter := repo.Query(Not(Eq("color", "color_0")))
+	ids := collectIDs(t, iter)
+	for _, id := range ids {
+		if id%4 == 0 {
+			t.Errorf("Not(color_0) returned id %d which should be color_0", id)
+		}
+	}
+}
+
+func TestTieredCompactionPreservesLargeSegments(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	repo, err := store.Repo(Schema{
+		Name: "items",
+		Fields: []Field{
+			{Name: "val", Type: Range(Uint64BE)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create 1 large segment (100 records = tier 3).
+	for i := 0; i < 100; i++ {
+		repo.Index(uint64(i), Record{"val": uint64(i)})
+	}
+	repo.Flush()
+
+	// Create 3 small segments (1 record each = tier 0).
+	for i := 100; i < 103; i++ {
+		repo.Index(uint64(i), Record{"val": uint64(i)})
+		repo.Flush()
+	}
+
+	// 4 segments total but only 3 in tier 0 (below threshold).
+	// The large segment should not be touched.
+	if err := repo.Compact(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo.mu.RLock()
+	n := len(repo.segments)
+	repo.mu.RUnlock()
+
+	// Should still have 4 segments (no tier reached minMerge).
+	if n != 4 {
+		t.Errorf("expected 4 segments (no merge), got %d", n)
+	}
+
+	total := repo.Count(Gte("val", uint64(0)))
+	if total != 103 {
+		t.Errorf("total = %d, want 103", total)
+	}
 }

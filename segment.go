@@ -272,6 +272,14 @@ func (fi *fieldIndex) close() {
 	}
 }
 
+// size returns the number of record IDs in this segment.
+func (s *segment) size() uint64 {
+	if s.allIDs != nil {
+		return s.allIDs.GetCardinality()
+	}
+	return 0
+}
+
 func (s *segment) close() {
 	for _, fi := range s.fields {
 		fi.close()
