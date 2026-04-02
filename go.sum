@@ -18,5 +18,7 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/tulpenhaendler/dict v0.0.0-20260402110810-d3195abd0dd2 h1:jKANyxbs41GWOUmQeNCc31FVhA5ke9m2Wx/hqWfpKGM=
 github.com/tulpenhaendler/dict v0.0.0-20260402110810-d3195abd0dd2/go.mod h1:L76oRGMMvNICLSJ55vZf5I6aHnr6XJzHuNHe6OeovRg=
+github.com/tulpenhaendler/dict v0.1.0 h1:7Gc4iI8ifoBm0pDZsNaTQp4ER0k6Wdi3zjz3sJwK2Mk=
+github.com/tulpenhaendler/dict v0.1.0/go.mod h1:L76oRGMMvNICLSJ55vZf5I6aHnr6XJzHuNHe6OeovRg=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=

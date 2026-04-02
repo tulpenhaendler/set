@@ -181,7 +181,7 @@ func TestCrossRepoIntersect(t *testing.T) {
 	}
 
 	// Verify we can resolve back through dict.
-	s, _, err := store.Dict().Reverse(ids[0])
+	s, err := store.Dict().Reverse(ids[0], dict.KeyRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
