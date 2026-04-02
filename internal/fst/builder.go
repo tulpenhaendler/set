@@ -7,19 +7,19 @@
 //
 // Binary format:
 //
-//	[magic:4]["FST1"]
-//	[version:1][0x01]
+//	[magic:4]["FST2"]
+//	[version:1][0x02]
 //	[root_addr:8]
 //	[num_keys:8]
 //	[...states...]
 //
 // Each state:
 //
-//	[num_transitions:1]
+//	[num_transitions:2]
 //	[is_final:1]
-//	[final_output:8] (only if is_final)
+//	[final_output:uvarint] (only if is_final)
 //	for each transition:
-//	  [byte:1][output:8][target_addr:8]
+//	  [byte:1][output:uvarint][target_addr:uvarint]
 package fst
 
 import (
@@ -30,9 +30,9 @@ import (
 	"sort"
 )
 
-var magic = [4]byte{'F', 'S', 'T', '1'}
+var magic = [4]byte{'F', 'S', 'T', '2'}
 
-const version = 1
+const version = 2
 const headerSize = 4 + 1 + 8 + 8 // magic + version + root_addr + num_keys
 
 // Builder constructs an FST from sorted key/value pairs.
@@ -44,6 +44,7 @@ type Builder struct {
 	// For minimization: registry of frozen states.
 	registry map[string]int64 // serialized state → address
 	scratch  bytes.Buffer     // reused for node serialization
+	tmp      [binary.MaxVarintLen64]byte
 
 	// Build stack.
 	frontier []*builderNode
@@ -88,7 +89,6 @@ func (b *Builder) Add(key []byte, value uint64) error {
 		return fmt.Errorf("fst: keys must be added in sorted order (got %x after %x)", key, b.lastKey)
 	}
 
-	// Find the common prefix length with the last key.
 	prefixLen := 0
 	if b.lastKey != nil {
 		for prefixLen < len(key) && prefixLen < len(b.lastKey) && key[prefixLen] == b.lastKey[prefixLen] {
@@ -96,20 +96,16 @@ func (b *Builder) Add(key []byte, value uint64) error {
 		}
 	}
 
-	// Freeze states from last key that diverge from this key.
 	b.freezeFrom(prefixLen + 1)
 
-	// Extend the frontier for the new key.
 	for i := len(b.frontier); i <= len(key); i++ {
 		b.frontier = append(b.frontier, &builderNode{})
 	}
 
-	// Add transitions from prefix to end of key.
 	for i := prefixLen; i < len(key); i++ {
 		b.frontier[i].addTransition(key[i], 0, b.frontier[i+1])
 	}
 
-	// The final state for this key.
 	b.frontier[len(key)].isFinal = true
 	b.frontier[len(key)].finalOutput = value
 
@@ -119,16 +115,10 @@ func (b *Builder) Add(key []byte, value uint64) error {
 }
 
 // Finish completes the FST and writes remaining data.
-// Returns the total bytes written.
 func (b *Builder) Finish() (int64, error) {
-	// Freeze all non-root nodes (compiles children, sets addrs in root's transitions).
 	b.freezeFrom(1)
-
-	// Now compile the root itself (all its transition addrs are resolved).
 	rootAddr := b.compileNode(b.frontier[0])
 
-	// Now write everything: header + all compiled states.
-	// We patch the header with root_addr and num_keys.
 	data := b.buf.Bytes()
 	binary.LittleEndian.PutUint64(data[5:13], uint64(rootAddr))
 	binary.LittleEndian.PutUint64(data[13:21], b.numKeys)
@@ -141,7 +131,6 @@ func (b *Builder) freezeFrom(level int) {
 	for i := len(b.frontier) - 1; i >= level; i-- {
 		if i > 0 {
 			parent := b.frontier[i-1]
-			// Find the transition from parent to this node and set its address.
 			for j := range parent.transitions {
 				if parent.transitions[j].target == b.frontier[i] {
 					parent.transitions[j].addr = b.compileNode(b.frontier[i])
@@ -150,20 +139,22 @@ func (b *Builder) freezeFrom(level int) {
 				}
 			}
 		}
-		// Reset this frontier slot for reuse.
 		b.frontier[i] = &builderNode{}
 	}
 	b.frontier = b.frontier[:level]
 	if level == 0 {
-		// Keep at least the root.
 		if len(b.frontier) == 0 {
 			b.frontier = append(b.frontier, &builderNode{})
 		}
 	}
 }
 
+func (b *Builder) putUvarint(buf *bytes.Buffer, v uint64) {
+	n := binary.PutUvarint(b.tmp[:], v)
+	buf.Write(b.tmp[:n])
+}
+
 func (b *Builder) compileNode(n *builderNode) int64 {
-	// Serialize once into scratch, use for both registry and output.
 	b.scratch.Reset()
 
 	sort.Slice(n.transitions, func(i, j int) bool {
@@ -173,14 +164,14 @@ func (b *Builder) compileNode(n *builderNode) int64 {
 	binary.Write(&b.scratch, binary.LittleEndian, uint16(len(n.transitions)))
 	if n.isFinal {
 		b.scratch.WriteByte(1)
-		binary.Write(&b.scratch, binary.LittleEndian, n.finalOutput)
+		b.putUvarint(&b.scratch, n.finalOutput)
 	} else {
 		b.scratch.WriteByte(0)
 	}
 	for _, t := range n.transitions {
 		b.scratch.WriteByte(t.b)
-		binary.Write(&b.scratch, binary.LittleEndian, t.output)
-		binary.Write(&b.scratch, binary.LittleEndian, t.addr)
+		b.putUvarint(&b.scratch, t.output)
+		b.putUvarint(&b.scratch, uint64(t.addr))
 	}
 
 	serialized := b.scratch.Bytes()

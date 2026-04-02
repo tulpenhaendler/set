@@ -18,15 +18,14 @@ The tradeoff is write speed. Building an FST is more expensive than inserting in
 
 ### Benchmark: 500k Tezos transactions
 
-```
-                         FST         SQLite      Speedup
-Eq(sender)               1.1 ms      19.6 ms     17x
-And(sender,target)        1.9 µs       6.6 µs      3.4x
-Range(level)            138 µs        3.0 ms      22x
-And(sender,range)       718 µs        2.0 ms       2.8x
-Disk                    108 MB       265 MB       2.5x smaller
-Total write             2.1 s         1.6 s       SQLite 1.3x faster
-```
+| Query | FST | SQLite | Speedup |
+|---|---|---|---|
+| Eq(sender) | 1.1 ms | 18.8 ms | **17x** |
+| And(sender,target) | 2.6 us | 6.7 us | **2.5x** |
+| Range(level) | 138 us | 2.9 ms | **21x** |
+| And(sender,range) | 727 us | 1.9 ms | **2.6x** |
+| Disk | 81 MB | 265 MB | **3.3x smaller** |
+| Total write | 2.0 s | 1.6 s | SQLite 1.3x faster |
 
 The advantage grows with data size. Bitmap operations scale linearly with set bits, while B-tree traversal adds per-row overhead. At 10M+ records, expect the query gap to widen further.
 
@@ -155,4 +154,4 @@ On-disk format per field:
 - `.fst` -- finite state transducer mapping encoded values to bitmap indices
 - `.roar` -- concatenated roaring bitmap data with an offset table
 
-FST prefix compression and roaring run-length encoding typically achieve 2-3x smaller indexes compared to equivalent B-tree indexes.
+FST prefix compression with varint-encoded transitions and roaring run-length encoding typically achieve 3x smaller indexes compared to equivalent B-tree indexes.

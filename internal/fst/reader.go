@@ -75,15 +75,12 @@ func (f *FST) Iterator(from, to []byte) *Iter {
 		to:   to,
 		done: false,
 	}
-	// Seek to the first key >= from.
 	it.seekFrom(from)
 	return it
 }
 
 // IteratorPrefix returns an iterator over all keys with the given prefix.
 func (f *FST) IteratorPrefix(prefix []byte) *Iter {
-	// Compute upper bound: prefix with last byte incremented.
-	// If the prefix ends with 0xFF bytes, we strip them (no upper bound for that suffix).
 	var to []byte
 	if len(prefix) > 0 {
 		to = make([]byte, len(prefix))
@@ -96,7 +93,7 @@ func (f *FST) IteratorPrefix(prefix []byte) *Iter {
 			to = to[:len(to)-1]
 		}
 		if len(to) == 0 {
-			to = nil // prefix is all 0xFF, no upper bound
+			to = nil
 		}
 	}
 	return f.Iterator(prefix, to)
@@ -104,20 +101,21 @@ func (f *FST) IteratorPrefix(prefix []byte) *Iter {
 
 // Iter iterates over FST entries in sorted key order.
 type Iter struct {
-	f    *FST
-	to   []byte
+	f     *FST
+	to    []byte
 	stack []iterFrame
-	key  []byte
+	key   []byte
 	value uint64
-	done bool
+	done  bool
 }
 
 type iterFrame struct {
 	state        state
-	transIdx     int // next transition index to visit
+	transIdx     int    // next transition index to visit
+	transOff     int    // byte offset of next transition to read
 	output       uint64
-	keyLen       int  // length of key at this frame
-	finalEmitted bool // whether we've already emitted this state's final output
+	keyLen       int
+	finalEmitted bool
 }
 
 func (it *Iter) seekFrom(from []byte) {
@@ -126,61 +124,57 @@ func (it *Iter) seekFrom(from []byte) {
 
 	s := it.f.readState(it.f.rootAddr)
 	it.stack = append(it.stack, iterFrame{
-		state:  s,
-		output: 0,
-		keyLen: 0,
+		state:    s,
+		output:   0,
+		keyLen:   0,
+		transOff: s.transBase,
 	})
 
 	if from == nil {
 		return
 	}
 
-	// Walk down the FST following `from`, setting transIdx to skip earlier transitions.
 	for i := 0; i < len(from); i++ {
 		frame := &it.stack[len(it.stack)-1]
 		s := frame.state
 
-		// Find the first transition >= from[i].
 		exactMatch := false
 		anyMatch := false
+		off := s.transBase
 		for j := 0; j < s.numTrans; j++ {
-			t := it.f.readTransition(s, j)
+			t, nextOff := it.f.readTransitionAt(off)
 			if t.b >= from[i] {
 				anyMatch = true
 				if t.b == from[i] {
-					// Exact match: follow this transition and continue seeking.
 					it.key = append(it.key, t.b)
 					nextOutput := frame.output + t.output
 					nextState := it.f.readState(t.addr)
-					frame.transIdx = j + 1 // parent will continue from next transition
+					frame.transIdx = j + 1
+					frame.transOff = nextOff
 					it.stack = append(it.stack, iterFrame{
-						state:  nextState,
-						output: nextOutput,
-						keyLen: len(it.key),
+						state:    nextState,
+						output:   nextOutput,
+						keyLen:   len(it.key),
+						transOff: nextState.transBase,
 					})
 					exactMatch = true
 				} else {
-					// t.b > from[i]: all keys from this transition onward are >= from.
-					// Stop seeking deeper; iteration will start from this transition.
 					frame.transIdx = j
+					frame.transOff = off
 				}
 				break
 			}
+			off = nextOff
 		}
 		if !anyMatch {
-			// All transitions < from[i]. This frame will pop (no more transitions).
 			frame.transIdx = s.numTrans
 			break
 		}
 		if !exactMatch {
-			// Found a greater transition; stop seeking deeper.
 			break
 		}
 	}
 
-	// Mark final outputs as emitted for states that correspond to keys < from.
-	// The deepest frame on the stack is at the seek position — if the key
-	// built so far is less than from, we should skip its final output.
 	if from != nil && len(it.stack) > 0 {
 		for si := range it.stack {
 			it.key = it.key[:it.stack[si].keyLen]
@@ -188,7 +182,6 @@ func (it *Iter) seekFrom(from []byte) {
 				it.stack[si].finalEmitted = true
 			}
 		}
-		// Restore key to the deepest frame's key.
 		if len(it.stack) > 0 {
 			it.key = it.key[:it.stack[len(it.stack)-1].keyLen]
 		}
@@ -204,7 +197,6 @@ func (it *Iter) Next() bool {
 	for len(it.stack) > 0 {
 		frame := &it.stack[len(it.stack)-1]
 
-		// Check if this state is final and we haven't emitted it yet.
 		if frame.state.isFinal && !frame.finalEmitted {
 			frame.finalEmitted = true
 			it.key = it.key[:frame.keyLen]
@@ -217,10 +209,10 @@ func (it *Iter) Next() bool {
 			return true
 		}
 
-		// Try next transition.
 		if frame.transIdx < frame.state.numTrans {
-			t := it.f.readTransition(frame.state, frame.transIdx)
+			t, nextOff := it.f.readTransitionAt(frame.transOff)
 			frame.transIdx++
+			frame.transOff = nextOff
 
 			it.key = append(it.key[:frame.keyLen], t.b)
 			nextOutput := frame.output + t.output
@@ -229,13 +221,13 @@ func (it *Iter) Next() bool {
 			it.stack = append(it.stack, iterFrame{
 				state:    nextState,
 				transIdx: 0,
+				transOff: nextState.transBase,
 				output:   nextOutput,
 				keyLen:   len(it.key),
 			})
 			continue
 		}
 
-		// Pop frame.
 		it.stack = it.stack[:len(it.stack)-1]
 	}
 
@@ -261,8 +253,9 @@ func (f *FST) readState(addr int64) state {
 	off++
 	var finalOutput uint64
 	if isFinal {
-		finalOutput = binary.LittleEndian.Uint64(f.data[off : off+8])
-		off += 8
+		var n int
+		finalOutput, n = binary.Uvarint(f.data[off:])
+		off += n
 	}
 	return state{
 		numTrans:    numTrans,
@@ -272,43 +265,29 @@ func (f *FST) readState(addr int64) state {
 	}
 }
 
-func (f *FST) readTransition(s state, idx int) transition {
-	// Each transition: [byte:1][output:8][addr:8] = 17 bytes
-	off := s.transBase + idx*17
-	return transition{
-		b:      f.data[off],
-		output: binary.LittleEndian.Uint64(f.data[off+1 : off+9]),
-		addr:   int64(binary.LittleEndian.Uint64(f.data[off+9 : off+17])),
-	}
+// readTransitionAt reads a transition at the given byte offset.
+// Returns the transition and the offset of the next transition.
+func (f *FST) readTransitionAt(off int) (transition, int) {
+	b := f.data[off]
+	off++
+	output, n := binary.Uvarint(f.data[off:])
+	off += n
+	addr, n := binary.Uvarint(f.data[off:])
+	off += n
+	return transition{b: b, output: output, addr: int64(addr)}, off
 }
 
 func (f *FST) findTransition(s state, b byte) (transition, bool) {
-	if s.numTrans > 16 {
-		// Binary search on the byte value (each transition is 17 bytes).
-		lo, hi := 0, s.numTrans-1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			mb := f.data[s.transBase+mid*17]
-			if mb == b {
-				return f.readTransition(s, mid), true
-			}
-			if mb < b {
-				lo = mid + 1
-			} else {
-				hi = mid - 1
-			}
-		}
-		return transition{}, false
-	}
+	off := s.transBase
 	for i := 0; i < s.numTrans; i++ {
-		t := f.readTransition(s, i)
+		t, nextOff := f.readTransitionAt(off)
 		if t.b == b {
 			return t, true
 		}
 		if t.b > b {
 			break
 		}
+		off = nextOff
 	}
 	return transition{}, false
 }
-
