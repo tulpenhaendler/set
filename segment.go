@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -38,6 +39,11 @@ type fieldIndex struct {
 }
 
 func openSegment(dir string, fieldNames []string) (*segment, error) {
+	// Verify checksum if present.
+	if err := verifySegmentChecksum(dir); err != nil {
+		return nil, fmt.Errorf("fst: checksum mismatch in %s: %w", filepath.Base(dir), err)
+	}
+
 	seg := &segment{
 		dir:    dir,
 		fields: make(map[string]*fieldIndex),
@@ -61,6 +67,39 @@ func openSegment(dir string, fieldNames []string) (*segment, error) {
 	}
 
 	return seg, nil
+}
+
+// verifySegmentChecksum checks the CRC32 checksum file if present.
+func verifySegmentChecksum(dir string) error {
+	stored, err := os.ReadFile(filepath.Join(dir, "checksum"))
+	if err != nil {
+		return nil // no checksum file, skip (pre-checksum segments)
+	}
+	if len(stored) != 4 {
+		return fmt.Errorf("invalid checksum file")
+	}
+	expected := binary.LittleEndian.Uint32(stored)
+
+	h := crc32.NewIEEE()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "checksum" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return err
+		}
+		h.Write([]byte(e.Name()))
+		h.Write(data)
+	}
+	if h.Sum32() != expected {
+		return fmt.Errorf("crc32 mismatch: stored %08x, computed %08x", expected, h.Sum32())
+	}
+	return nil
 }
 
 // mmapFile maps a file into memory as read-only.
@@ -112,9 +151,22 @@ func openFieldIndex(dir, name string) (*fieldIndex, error) {
 		return nil, fmt.Errorf("mmap roar: %w", err)
 	}
 
-	var count uint32
-	if len(roarData) >= 4 {
-		count = binary.LittleEndian.Uint32(roarData[:4])
+	if len(roarData) < 4 {
+		syscall.Munmap(fstData)
+		if roarData != nil {
+			syscall.Munmap(roarData)
+		}
+		return nil, fmt.Errorf("roar file too short")
+	}
+
+	count := binary.LittleEndian.Uint32(roarData[:4])
+
+	// Validate roar header: offset table must fit within the file.
+	expectedHeader := 4 + int(count)*8
+	if expectedHeader > len(roarData) {
+		syscall.Munmap(fstData)
+		syscall.Munmap(roarData)
+		return nil, fmt.Errorf("roar header truncated: need %d bytes, have %d", expectedHeader, len(roarData))
 	}
 
 	c, _ := lru.New[uint32, *roaring64.Bitmap](bitmapCacheSize)

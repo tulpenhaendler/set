@@ -258,15 +258,20 @@ func TestCorruptedFSTFile(t *testing.T) {
 		}
 	}
 
-	// Reopen should fail gracefully (bad magic or short data).
+	// Reopen: corrupted segment should be detected by checksum and skipped.
 	store2, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store2.Close()
-	_, err = store2.Repo(schema)
-	if err == nil {
-		t.Log("reopened with corrupted FST (may have been too short to detect)")
+	repo2, err := store2.Repo(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Corrupted segment was skipped, so no data should be visible.
+	count := repo2.Count(Eq("color", "red"))
+	if count != 0 {
+		t.Errorf("expected 0 results after corruption, got %d", count)
 	}
 }
 
@@ -312,7 +317,7 @@ func TestCorruptedBitmapData(t *testing.T) {
 		}
 	}
 
-	// Reopen and query -- should not panic, return empty results.
+	// Reopen: corrupted segment detected by checksum, skipped.
 	store2, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +329,7 @@ func TestCorruptedBitmapData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// This should not panic even with corrupted bitmaps.
+	// Corrupted segment was skipped, query should not panic.
 	iter := repo2.Query(Eq("color", "red"))
 	for iter.Next() {
 		_ = iter.ID()

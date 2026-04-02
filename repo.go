@@ -31,6 +31,7 @@ type Repo struct {
 	nextSeg   int
 	buffer    []bufferedRecord
 	flushing  []bufferedRecord // buffer being flushed, visible to queries until segment is live
+	flushMu   sync.Mutex       // serializes concurrent Flush calls
 	compactMu sync.Mutex
 
 	// Pre-computed field layout.
@@ -100,15 +101,25 @@ func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
 	}
 	sort.Ints(segNums)
 
+	loadedSegs := make(map[int]bool)
 	for _, n := range segNums {
 		segPath := filepath.Join(segDir, fmt.Sprintf("%06d", n))
 		seg, err := openSegment(segPath, fieldNames)
 		if err != nil {
-			return nil, fmt.Errorf("fst: open segment %d: %w", n, err)
+			// Skip corrupted segments rather than failing to open.
+			continue
 		}
 		r.segments = append(r.segments, seg)
+		loadedSegs[n] = true
 		if n >= r.nextSeg {
 			r.nextSeg = n + 1
+		}
+	}
+
+	// Remove orphan segment directories (from crashed flushes/compactions).
+	for _, n := range segNums {
+		if !loadedSegs[n] {
+			os.RemoveAll(filepath.Join(segDir, fmt.Sprintf("%06d", n)))
 		}
 	}
 
@@ -174,10 +185,13 @@ func (r *Repo) BatchIndex(ids []uint64, recs []Record) error {
 // Flush writes the in-memory buffer to a new immutable segment.
 // Records remain visible to queries throughout the flush.
 func (r *Repo) Flush() error {
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
+
 	r.mu.Lock()
 	buf := r.buffer
 	r.buffer = nil
-	r.flushing = buf // keep visible to queries during build
+	r.flushing = buf
 	segNum := r.nextSeg
 	r.nextSeg++
 	r.mu.Unlock()
@@ -207,18 +221,29 @@ func (r *Repo) Flush() error {
 	}
 
 	if err := sb.build(); err != nil {
+		os.RemoveAll(segDir)
+		// Restore buffer so records aren't lost.
+		r.mu.Lock()
+		r.buffer = append(buf, r.buffer...)
+		r.flushing = nil
+		r.mu.Unlock()
 		return err
 	}
 
 	fieldNames := allFieldNames(r.schema)
 	seg, err := openSegment(segDir, fieldNames)
 	if err != nil {
+		os.RemoveAll(segDir)
+		r.mu.Lock()
+		r.buffer = append(buf, r.buffer...)
+		r.flushing = nil
+		r.mu.Unlock()
 		return err
 	}
 
 	r.mu.Lock()
 	r.segments = append(r.segments, seg)
-	r.flushing = nil // segment is live, stop scanning flushing buffer
+	r.flushing = nil
 	r.mu.Unlock()
 
 	return nil

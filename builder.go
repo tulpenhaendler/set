@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
@@ -96,7 +97,35 @@ func (sb *segmentBuilder) build() error {
 		f.Close()
 	}
 
+	// Write checksum file covering all segment data.
+	if err := writeSegmentChecksum(sb.dir); err != nil {
+		return fmt.Errorf("fst: write checksum: %w", err)
+	}
+
 	return nil
+}
+
+// writeSegmentChecksum writes a CRC32 checksum of all data files in a segment.
+func writeSegmentChecksum(dir string) error {
+	h := crc32.NewIEEE()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "checksum" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return err
+		}
+		h.Write([]byte(e.Name()))
+		h.Write(data)
+	}
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], h.Sum32())
+	return os.WriteFile(filepath.Join(dir, "checksum"), buf[:], 0644)
 }
 
 func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
