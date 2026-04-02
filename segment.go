@@ -119,19 +119,18 @@ func openFieldIndex(dir, name string) (*fieldIndex, error) {
 	}, nil
 }
 
-// lookupEq returns the union of all bucket bitmaps for a field value.
-func (fi *fieldIndex) lookupEq(valueKey []byte) *roaring64.Bitmap {
-	result := roaring64.New()
+// lookupEq ORs all bucket bitmaps for a field value into dst.
+func (fi *fieldIndex) lookupEq(valueKey []byte, dst *roaring64.Bitmap) {
 	it := fi.fst.IteratorPrefix(valueKey)
 	for it.Next() {
-		bm := fi.loadBitmap(uint32(it.Value()))
-		result.Or(bm)
+		dst.Or(fi.loadBitmap(uint32(it.Value())))
 	}
-	return result
 }
 
 // probeEqBuckets intersects candidates with a value using bucket-level pruning.
+// Uses a pooled tmp bitmap to avoid per-iteration allocations.
 func (fi *fieldIndex) probeEqBuckets(valueKey []byte, candidateBuckets *roaring64.Bitmap, candidates *roaring64.Bitmap, result *roaring64.Bitmap) {
+	tmp := getBitmap()
 	it := fi.fst.IteratorPrefix(valueKey)
 	for it.Next() {
 		compositeKey := it.Key()
@@ -143,30 +142,28 @@ func (fi *fieldIndex) probeEqBuckets(valueKey []byte, candidateBuckets *roaring6
 			continue
 		}
 		bm := fi.loadBitmap(uint32(it.Value()))
-		result.Or(roaring64.And(bm, candidates))
+		tmp.Or(bm)
+		tmp.And(candidates)
+		result.Or(tmp)
+		tmp.Clear()
 	}
+	bitmapPool.Put(tmp)
 }
 
-// lookupRange returns the union of all bitmaps for keys in [from, to).
-func (fi *fieldIndex) lookupRange(from, to []byte) *roaring64.Bitmap {
-	result := roaring64.New()
+// lookupRange ORs all bitmaps for keys in [from, to) into dst.
+func (fi *fieldIndex) lookupRange(from, to []byte, dst *roaring64.Bitmap) {
 	it := fi.fst.Iterator(from, to)
 	for it.Next() {
-		bm := fi.loadBitmap(uint32(it.Value()))
-		result.Or(bm)
+		dst.Or(fi.loadBitmap(uint32(it.Value())))
 	}
-	return result
 }
 
-// lookupAll returns the union of all bitmaps.
-func (fi *fieldIndex) lookupAll() *roaring64.Bitmap {
-	result := roaring64.New()
+// lookupAll ORs all bitmaps into dst.
+func (fi *fieldIndex) lookupAll(dst *roaring64.Bitmap) {
 	it := fi.fst.Iterator(nil, nil)
 	for it.Next() {
-		bm := fi.loadBitmap(uint32(it.Value()))
-		result.Or(bm)
+		dst.Or(fi.loadBitmap(uint32(it.Value())))
 	}
-	return result
 }
 
 // estimateEq returns estimated cardinality by summing bucket bitmap sizes.

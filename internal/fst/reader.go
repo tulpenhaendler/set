@@ -283,14 +283,30 @@ func (f *FST) readTransition(s state, idx int) transition {
 }
 
 func (f *FST) findTransition(s state, b byte) (transition, bool) {
-	// Linear scan (states usually have few transitions).
+	if s.numTrans > 16 {
+		// Binary search on the byte value (each transition is 17 bytes).
+		lo, hi := 0, s.numTrans-1
+		for lo <= hi {
+			mid := (lo + hi) / 2
+			mb := f.data[s.transBase+mid*17]
+			if mb == b {
+				return f.readTransition(s, mid), true
+			}
+			if mb < b {
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+		return transition{}, false
+	}
 	for i := 0; i < s.numTrans; i++ {
 		t := f.readTransition(s, i)
 		if t.b == b {
 			return t, true
 		}
 		if t.b > b {
-			break // transitions are sorted
+			break
 		}
 	}
 	return transition{}, false

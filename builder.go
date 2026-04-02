@@ -1,6 +1,7 @@
 package set
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -133,6 +134,20 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	}
 
 	// Build roaring file: [count:4][offsets:8*count][bitmap data...]
+	// Serialize bitmaps to a buffer to compute offsets, then write sequentially.
+	count := uint32(len(groups))
+	headerLen := 4 + int(count)*8
+
+	var bitmapData bytes.Buffer
+	offsets := make([]uint64, count)
+	for i, g := range groups {
+		g.bitmap.RunOptimize()
+		offsets[i] = uint64(headerLen) + uint64(bitmapData.Len())
+		if _, err := g.bitmap.WriteTo(&bitmapData); err != nil {
+			return fmt.Errorf("write bitmap %d: %w", i, err)
+		}
+	}
+
 	roarPath := filepath.Join(sb.dir, name+".roar")
 	roarFile, err := os.Create(roarPath)
 	if err != nil {
@@ -140,38 +155,11 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	}
 	defer roarFile.Close()
 
-	count := uint32(len(groups))
-
-	// Write header: count + placeholder offsets.
-	if err := binary.Write(roarFile, binary.LittleEndian, count); err != nil {
-		return err
+	w := bufio.NewWriterSize(roarFile, 65536)
+	binary.Write(w, binary.LittleEndian, count)
+	for _, off := range offsets {
+		binary.Write(w, binary.LittleEndian, off)
 	}
-	offsets := make([]int64, count)
-	for i := uint32(0); i < count; i++ {
-		if err := binary.Write(roarFile, binary.LittleEndian, int64(0)); err != nil {
-			return err
-		}
-	}
-
-	// Write bitmaps, recording actual file positions.
-	for i, g := range groups {
-		g.bitmap.RunOptimize()
-		pos, _ := roarFile.Seek(0, 1)
-		offsets[i] = pos
-		if _, err := g.bitmap.WriteTo(roarFile); err != nil {
-			return fmt.Errorf("write bitmap %d: %w", i, err)
-		}
-	}
-
-	// Patch offsets in header.
-	for i, off := range offsets {
-		if _, err := roarFile.Seek(int64(4+i*8), 0); err != nil {
-			return err
-		}
-		if err := binary.Write(roarFile, binary.LittleEndian, off); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	w.Write(bitmapData.Bytes())
+	return w.Flush()
 }

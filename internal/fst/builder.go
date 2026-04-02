@@ -43,6 +43,7 @@ type Builder struct {
 
 	// For minimization: registry of frozen states.
 	registry map[string]int64 // serialized state → address
+	scratch  bytes.Buffer     // reused for node serialization
 
 	// Build stack.
 	frontier []*builderNode
@@ -162,57 +163,36 @@ func (b *Builder) freezeFrom(level int) {
 }
 
 func (b *Builder) compileNode(n *builderNode) int64 {
-	// Serialize the node to check the registry.
-	key := serializeNode(n)
-	if addr, ok := b.registry[string(key)]; ok {
+	// Serialize once into scratch, use for both registry and output.
+	b.scratch.Reset()
+
+	sort.Slice(n.transitions, func(i, j int) bool {
+		return n.transitions[i].b < n.transitions[j].b
+	})
+
+	binary.Write(&b.scratch, binary.LittleEndian, uint16(len(n.transitions)))
+	if n.isFinal {
+		b.scratch.WriteByte(1)
+		binary.Write(&b.scratch, binary.LittleEndian, n.finalOutput)
+	} else {
+		b.scratch.WriteByte(0)
+	}
+	for _, t := range n.transitions {
+		b.scratch.WriteByte(t.b)
+		binary.Write(&b.scratch, binary.LittleEndian, t.output)
+		binary.Write(&b.scratch, binary.LittleEndian, t.addr)
+	}
+
+	serialized := b.scratch.Bytes()
+	if addr, ok := b.registry[string(serialized)]; ok {
 		return addr
 	}
 
 	addr := b.written
-	b.registry[string(key)] = addr
-
-	// Write to buffer.
-	binary.Write(&b.buf, binary.LittleEndian, uint16(len(n.transitions)))
-	if n.isFinal {
-		b.buf.WriteByte(1)
-		binary.Write(&b.buf, binary.LittleEndian, n.finalOutput)
-	} else {
-		b.buf.WriteByte(0)
-	}
-
-	// Sort transitions by byte value for binary search during lookup.
-	sort.Slice(n.transitions, func(i, j int) bool {
-		return n.transitions[i].b < n.transitions[j].b
-	})
-
-	for _, t := range n.transitions {
-		b.buf.WriteByte(t.b)
-		binary.Write(&b.buf, binary.LittleEndian, t.output)
-		binary.Write(&b.buf, binary.LittleEndian, t.addr)
-	}
-
+	b.registry[string(serialized)] = addr
+	b.buf.Write(serialized)
 	b.written = headerSize + int64(b.buf.Len()-int(headerSize))
 	return addr
-}
-
-func serializeNode(n *builderNode) []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, uint16(len(n.transitions)))
-	if n.isFinal {
-		buf.WriteByte(1)
-		binary.Write(&buf, binary.LittleEndian, n.finalOutput)
-	} else {
-		buf.WriteByte(0)
-	}
-	sort.Slice(n.transitions, func(i, j int) bool {
-		return n.transitions[i].b < n.transitions[j].b
-	})
-	for _, t := range n.transitions {
-		buf.WriteByte(t.b)
-		binary.Write(&buf, binary.LittleEndian, t.output)
-		binary.Write(&buf, binary.LittleEndian, t.addr)
-	}
-	return buf.Bytes()
 }
 
 func (n *builderNode) addTransition(b byte, output uint64, target *builderNode) {

@@ -146,6 +146,43 @@ func (r *Repo) Count(q Query) uint64 {
 	return bm.GetCardinality()
 }
 
+// evalField evaluates fn across all segments for a field, merging results.
+// Parallelizes across goroutines when there are 3+ segments.
+func evalField(segments []*segment, field string, fn func(*fieldIndex, *roaring64.Bitmap)) *roaring64.Bitmap {
+	result := roaring64.New()
+	if len(segments) < 3 {
+		for _, seg := range segments {
+			if fi := seg.fields[field]; fi != nil {
+				fn(fi, result)
+			}
+		}
+		return result
+	}
+
+	bitmaps := make([]*roaring64.Bitmap, len(segments))
+	var wg sync.WaitGroup
+	for i, seg := range segments {
+		fi := seg.fields[field]
+		if fi == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, fi *fieldIndex) {
+			defer wg.Done()
+			bm := roaring64.New()
+			fn(fi, bm)
+			bitmaps[i] = bm
+		}(i, fi)
+	}
+	wg.Wait()
+	for _, bm := range bitmaps {
+		if bm != nil {
+			result.Or(bm)
+		}
+	}
+	return result
+}
+
 // eval implementations
 
 func (q *eqQuery) eval(r *Repo) *roaring64.Bitmap {
@@ -153,16 +190,9 @@ func (q *eqQuery) eval(r *Repo) *roaring64.Bitmap {
 	if key == nil {
 		return roaring64.New()
 	}
-
-	result := roaring64.New()
-	for _, seg := range r.segments {
-		fi := seg.fields[q.field]
-		if fi == nil {
-			continue
-		}
-		result.Or(fi.lookupEq(key))
-	}
-	return result
+	return evalField(r.segments, q.field, func(fi *fieldIndex, dst *roaring64.Bitmap) {
+		fi.lookupEq(key, dst)
+	})
 }
 
 func (q *eqQuery) estimateCount(r *Repo) uint64 {
@@ -204,19 +234,12 @@ func (q *gtQuery) eval(r *Repo) *roaring64.Bitmap {
 	if q.inclusive {
 		from = key
 	} else {
-		// Exclusive: start after all composite keys for this value.
 		from = NextValueKey(key)
 	}
 
-	result := roaring64.New()
-	for _, seg := range r.segments {
-		fi := seg.fields[q.field]
-		if fi == nil {
-			continue
-		}
-		result.Or(fi.lookupRange(from, nil))
-	}
-	return result
+	return evalField(r.segments, q.field, func(fi *fieldIndex, dst *roaring64.Bitmap) {
+		fi.lookupRange(from, nil, dst)
+	})
 }
 
 func (q *ltQuery) estimateCount(r *Repo) uint64 {
@@ -241,21 +264,14 @@ func (q *ltQuery) eval(r *Repo) *roaring64.Bitmap {
 
 	var to []byte
 	if q.inclusive {
-		// Include all composite keys for this value.
 		to = NextValueKey(key)
 	} else {
 		to = key
 	}
 
-	result := roaring64.New()
-	for _, seg := range r.segments {
-		fi := seg.fields[q.field]
-		if fi == nil {
-			continue
-		}
-		result.Or(fi.lookupRange(nil, to))
-	}
-	return result
+	return evalField(r.segments, q.field, func(fi *fieldIndex, dst *roaring64.Bitmap) {
+		fi.lookupRange(nil, to, dst)
+	})
 }
 
 func (q *betweenQuery) estimateCount(r *Repo) uint64 {
@@ -274,18 +290,11 @@ func (q *betweenQuery) eval(r *Repo) *roaring64.Bitmap {
 		return roaring64.New()
 	}
 
-	// Inclusive on both ends: range [lo, nextAfter(hi)).
 	to := NextValueKey(hiKey)
 
-	result := roaring64.New()
-	for _, seg := range r.segments {
-		fi := seg.fields[q.field]
-		if fi == nil {
-			continue
-		}
-		result.Or(fi.lookupRange(loKey, to))
-	}
-	return result
+	return evalField(r.segments, q.field, func(fi *fieldIndex, dst *roaring64.Bitmap) {
+		fi.lookupRange(loKey, to, dst)
+	})
 }
 
 func (q *prefixQuery) estimateCount(r *Repo) uint64 {
@@ -314,19 +323,12 @@ func estimateRange(r *Repo, field string, from, to []byte) uint64 {
 }
 
 func (q *prefixQuery) eval(r *Repo) *roaring64.Bitmap {
-	result := roaring64.New()
-	for _, seg := range r.segments {
-		fi := seg.fields[q.field]
-		if fi == nil {
-			continue
-		}
+	return evalField(r.segments, q.field, func(fi *fieldIndex, dst *roaring64.Bitmap) {
 		it := fi.fst.IteratorPrefix(q.value)
 		for it.Next() {
-			bm := fi.loadBitmap(uint32(it.Value()))
-			result.Or(bm)
+			dst.Or(fi.loadBitmap(uint32(it.Value())))
 		}
-	}
-	return result
+	})
 }
 
 func (q *andQuery) eval(r *Repo) *roaring64.Bitmap {
@@ -411,17 +413,10 @@ func (q *andQuery) tryComposite(r *Repo) *roaring64.Bitmap {
 			ck = append(ck, key...)
 		}
 
-		// Lookup in the composite field's FST (prefix scan for buckets).
 		cname := compositeFieldName(c)
-		result := roaring64.New()
-		for _, seg := range r.segments {
-			fi := seg.fields[cname]
-			if fi == nil {
-				continue
-			}
-			result.Or(fi.lookupEq(ck))
-		}
-		return result
+		return evalField(r.segments, cname, func(fi *fieldIndex, dst *roaring64.Bitmap) {
+			fi.lookupEq(ck, dst)
+		})
 	}
 
 	return nil
@@ -489,11 +484,10 @@ func (q *notQuery) estimateCount(r *Repo) uint64 {
 
 func (q *notQuery) eval(r *Repo) *roaring64.Bitmap {
 	inner := q.inner.eval(r)
-	// Get all record IDs across all segments for all fields.
 	all := roaring64.New()
 	for _, seg := range r.segments {
 		for _, fi := range seg.fields {
-			all.Or(fi.lookupAll())
+			fi.lookupAll(all)
 		}
 	}
 	all.AndNot(inner)

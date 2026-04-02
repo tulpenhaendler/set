@@ -3,6 +3,8 @@ package set
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
 func TestSegmentBuildAndQuery(t *testing.T) {
@@ -41,40 +43,52 @@ func TestSegmentBuildAndQuery(t *testing.T) {
 	}
 	defer seg.close()
 
+	lookup := func(fi *fieldIndex, key []byte) *roaring64.Bitmap {
+		bm := roaring64.New()
+		fi.lookupEq(key, bm)
+		return bm
+	}
+
+	lookupRange := func(fi *fieldIndex, from, to []byte) *roaring64.Bitmap {
+		bm := roaring64.New()
+		fi.lookupRange(from, to, bm)
+		return bm
+	}
+
 	// Eq: color=red (dict_id=100) → records {1, 2}
-	bm := seg.fields["color"].lookupEq(EncodeKey(100))
+	bm := lookup(seg.fields["color"], EncodeKey(100))
 	if bm.GetCardinality() != 2 || !bm.Contains(1) || !bm.Contains(2) {
 		t.Errorf("color=red: got %v, want {1, 2}", bm.ToArray())
 	}
 
 	// Eq: color=blue (dict_id=200) → records {3, 4}
-	bm = seg.fields["color"].lookupEq(EncodeKey(200))
+	bm = lookup(seg.fields["color"], EncodeKey(200))
 	if bm.GetCardinality() != 2 || !bm.Contains(3) || !bm.Contains(4) {
 		t.Errorf("color=blue: got %v, want {3, 4}", bm.ToArray())
 	}
 
 	// Eq: size=10 → records {1, 4}
-	bm = seg.fields["size"].lookupEq(EncodeKey(10))
+	bm = lookup(seg.fields["size"], EncodeKey(10))
 	if bm.GetCardinality() != 2 || !bm.Contains(1) || !bm.Contains(4) {
 		t.Errorf("size=10: got %v, want {1, 4}", bm.ToArray())
 	}
 
 	// Range: size >= 20 → records {2, 3}
-	bm = seg.fields["size"].lookupRange(EncodeKey(20), nil)
+	bm = lookupRange(seg.fields["size"], EncodeKey(20), nil)
 	if bm.GetCardinality() != 2 || !bm.Contains(2) || !bm.Contains(3) {
 		t.Errorf("size>=20: got %v, want {2, 3}", bm.ToArray())
 	}
 
 	// Intersection: color=red AND size=10 → record {1}
-	bmColor := seg.fields["color"].lookupEq(EncodeKey(100))
-	bmSize := seg.fields["size"].lookupEq(EncodeKey(10))
+	bmColor := lookup(seg.fields["color"], EncodeKey(100))
+	bmSize := lookup(seg.fields["size"], EncodeKey(10))
 	bmColor.And(bmSize)
 	if bmColor.GetCardinality() != 1 || !bmColor.Contains(1) {
 		t.Errorf("color=red AND size=10: got %v, want {1}", bmColor.ToArray())
 	}
 
 	// Not found.
-	bm = seg.fields["color"].lookupEq(EncodeKey(999))
+	bm = lookup(seg.fields["color"], EncodeKey(999))
 	if bm.GetCardinality() != 0 {
 		t.Errorf("color=999: got %v, want empty", bm.ToArray())
 	}

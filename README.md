@@ -14,18 +14,18 @@ General-purpose databases are designed for mutable, row-oriented workloads. Bloc
 
 **Elasticsearch** supports bitmap-like operations internally but carries enormous operational overhead -- JVM tuning, cluster management, shard rebalancing. For a single-node indexer processing blockchain data, it's the wrong tool.
 
-The tradeoff is write speed. Building an FST is more expensive than inserting into a B-tree. For blockchain data this is the right tradeoff: blocks are immutable, data is append-only, and reads vastly outnumber writes. You flush once per batch of blocks and query constantly.
+The tradeoff is write speed. Building an FST is more expensive than inserting into a B-tree, though the gap is small (~1.3x). For blockchain data this is the right tradeoff: blocks are immutable, data is append-only, and reads vastly outnumber writes. You flush once per batch of blocks and query constantly.
 
 ### Benchmark: 500k Tezos transactions
 
 ```
                          FST         SQLite      Speedup
-Eq(sender)               1.1 ms      18.8 ms     17x
-And(sender,target)        2.2 µs       6.5 µs      3x
-Range(level)            136 µs        2.9 ms      21x
-And(sender,range)       641 µs        1.9 ms       3x
+Eq(sender)               1.1 ms      19.6 ms     17x
+And(sender,target)        1.9 µs       6.6 µs      3.4x
+Range(level)            138 µs        3.0 ms      22x
+And(sender,range)       718 µs        2.0 ms       2.8x
 Disk                    108 MB       265 MB       2.5x smaller
-Total write             6.5 s         1.6 s       SQLite 4x faster
+Total write             2.1 s         1.6 s       SQLite 1.3x faster
 ```
 
 The advantage grows with data size. Bitmap operations scale linearly with set bits, while B-tree traversal adds per-row overhead. At 10M+ records, expect the query gap to widen further.
