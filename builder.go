@@ -15,7 +15,6 @@ import (
 )
 
 // BucketSize is the max number of record IDs per bitmap chunk.
-// Smaller = more granular pruning in And queries, larger = fewer FST keys.
 const BucketSize = 10000
 
 // fieldBuffer accumulates (encoded_key, record_id) pairs for one field.
@@ -32,7 +31,8 @@ type fieldEntry struct {
 type segmentBuilder struct {
 	dir    string
 	fields []Field
-	bufs   map[string]*fieldBuffer // field name → buffer
+	bufs   map[string]*fieldBuffer
+	arena  []byte // shared backing store for key copies
 }
 
 func newSegmentBuilder(dir string, fields []Field) *segmentBuilder {
@@ -45,9 +45,12 @@ func newSegmentBuilder(dir string, fields []Field) *segmentBuilder {
 
 func (sb *segmentBuilder) add(fieldName string, key []byte, recordID uint64) {
 	buf := sb.bufs[fieldName]
-	keyCopy := make([]byte, len(key))
-	copy(keyCopy, key)
-	buf.entries = append(buf.entries, fieldEntry{key: keyCopy, recordID: recordID})
+	start := len(sb.arena)
+	sb.arena = append(sb.arena, key...)
+	buf.entries = append(buf.entries, fieldEntry{
+		key:      sb.arena[start:len(sb.arena):len(sb.arena)],
+		recordID: recordID,
+	})
 }
 
 func (sb *segmentBuilder) build() error {
@@ -67,15 +70,6 @@ func (sb *segmentBuilder) build() error {
 	return nil
 }
 
-// compositeKey builds a bucketed FST key: encoded_value + bucket.
-func compositeKey(valueKey []byte, bucket uint64) []byte {
-	bucketKey := EncodeKey(bucket)
-	key := make([]byte, len(valueKey)+len(bucketKey))
-	copy(key, valueKey)
-	copy(key[len(valueKey):], bucketKey)
-	return key
-}
-
 func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	// Sort by (value_key, bucket) where bucket = recordID / BucketSize.
 	sort.Slice(buf.entries, func(i, j int) bool {
@@ -88,11 +82,13 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	})
 
 	// Group by (value_key, bucket) → roaring bitmap.
+	// Use a local arena for composite keys to avoid per-group allocations.
 	type keyBitmap struct {
-		key    []byte // composite key: value + bucket
+		key    []byte
 		bitmap *roaring64.Bitmap
 	}
 	var groups []keyBitmap
+	var keyArena []byte
 	currentIdx := -1
 	var currentValueKey []byte
 	currentBucket := uint64(0)
@@ -101,7 +97,11 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 		e := &buf.entries[i]
 		bucket := e.recordID / BucketSize
 		if currentIdx < 0 || !bytes.Equal(currentValueKey, e.key) || currentBucket != bucket {
-			ck := compositeKey(e.key, bucket)
+			start := len(keyArena)
+			keyArena = append(keyArena, e.key...)
+			keyArena = EncodeKeyTo(keyArena, bucket)
+			ck := keyArena[start:len(keyArena):len(keyArena)]
+
 			groups = append(groups, keyBitmap{
 				key:    ck,
 				bitmap: roaring64.New(),
@@ -112,8 +112,6 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 		}
 		groups[currentIdx].bitmap.Add(e.recordID)
 	}
-
-	// Groups are already sorted since entries were sorted by (value, bucket).
 
 	// Build FST: composite_key → bitmap index.
 	fstPath := filepath.Join(sb.dir, name+".fst")
@@ -132,9 +130,11 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	if _, err := builder.Finish(); err != nil {
 		return fmt.Errorf("fst finish: %w", err)
 	}
+	if err := fstFile.Sync(); err != nil {
+		return fmt.Errorf("fsync fst: %w", err)
+	}
 
 	// Build roaring file: [count:4][offsets:8*count][bitmap data...]
-	// Serialize bitmaps to a buffer to compute offsets, then write sequentially.
 	count := uint32(len(groups))
 	headerLen := 4 + int(count)*8
 
@@ -161,5 +161,11 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 		binary.Write(w, binary.LittleEndian, off)
 	}
 	w.Write(bitmapData.Bytes())
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush roar: %w", err)
+	}
+	if err := roarFile.Sync(); err != nil {
+		return fmt.Errorf("fsync roar: %w", err)
+	}
+	return nil
 }

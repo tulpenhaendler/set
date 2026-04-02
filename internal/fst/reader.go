@@ -81,10 +81,16 @@ func (f *FST) Iterator(from, to []byte) *Iter {
 
 // IteratorPrefix returns an iterator over all keys with the given prefix.
 func (f *FST) IteratorPrefix(prefix []byte) *Iter {
-	var to []byte
+	it := &Iter{f: f, done: false}
 	if len(prefix) > 0 {
-		to = make([]byte, len(prefix))
-		copy(to, prefix)
+		var to []byte
+		if len(prefix) <= len(it.toBuf) {
+			n := copy(it.toBuf[:], prefix)
+			to = it.toBuf[:n]
+		} else {
+			to = make([]byte, len(prefix))
+			copy(to, prefix)
+		}
 		for len(to) > 0 {
 			if to[len(to)-1] < 0xFF {
 				to[len(to)-1]++
@@ -92,17 +98,19 @@ func (f *FST) IteratorPrefix(prefix []byte) *Iter {
 			}
 			to = to[:len(to)-1]
 		}
-		if len(to) == 0 {
-			to = nil
+		if len(to) > 0 {
+			it.to = to
 		}
 	}
-	return f.Iterator(prefix, to)
+	it.seekFrom(prefix)
+	return it
 }
 
 // Iter iterates over FST entries in sorted key order.
 type Iter struct {
 	f     *FST
 	to    []byte
+	toBuf [32]byte // inline storage for short upper bounds
 	stack []iterFrame
 	key   []byte
 	value uint64
@@ -247,12 +255,18 @@ func (it *Iter) Value() uint64 {
 
 func (f *FST) readState(addr int64) state {
 	off := int(addr)
+	if off+3 > len(f.data) {
+		return state{}
+	}
 	numTrans := int(binary.LittleEndian.Uint16(f.data[off : off+2]))
 	off += 2
 	isFinal := f.data[off] != 0
 	off++
 	var finalOutput uint64
 	if isFinal {
+		if off >= len(f.data) {
+			return state{}
+		}
 		var n int
 		finalOutput, n = binary.Uvarint(f.data[off:])
 		off += n
@@ -268,8 +282,14 @@ func (f *FST) readState(addr int64) state {
 // readTransitionAt reads a transition at the given byte offset.
 // Returns the transition and the offset of the next transition.
 func (f *FST) readTransitionAt(off int) (transition, int) {
+	if off >= len(f.data) {
+		return transition{}, off
+	}
 	b := f.data[off]
 	off++
+	if off >= len(f.data) {
+		return transition{b: b}, off
+	}
 	output, n := binary.Uvarint(f.data[off:])
 	off += n
 	addr, n := binary.Uvarint(f.data[off:])

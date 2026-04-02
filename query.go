@@ -496,16 +496,11 @@ func (q *notQuery) eval(r *Repo) *roaring64.Bitmap {
 
 // encodeQueryValue encodes a query value to an FST key.
 func (r *Repo) encodeQueryValue(fieldName string, value any) []byte {
-	var f *Field
-	for i := range r.schema.Fields {
-		if r.schema.Fields[i].Name == fieldName {
-			f = &r.schema.Fields[i]
-			break
-		}
-	}
-	if f == nil {
+	idx, ok := r.fieldMap[fieldName]
+	if !ok || idx >= r.nFields {
 		return nil
 	}
+	f := &r.schema.Fields[idx]
 
 	switch f.Type.Kind {
 	case KindString, KindSlice:
@@ -654,19 +649,23 @@ func evalBufferQuery(r *Repo, q Query) *roaring64.Bitmap {
 }
 
 func scanBuffer(r *Repo, fieldName string, match func([]byte) bool) *roaring64.Bitmap {
+	idx, ok := r.fieldMap[fieldName]
+	if !ok {
+		return roaring64.New()
+	}
 	bm := roaring64.New()
+	isSlice := idx < r.nFields && r.schema.Fields[idx].Type.Kind == KindSlice
 	for _, br := range r.buffer {
-		if key, ok := br.fields[fieldName]; ok {
-			if match(key) {
-				bm.Add(br.id)
-			}
-		}
-		if keys, ok := br.slices[fieldName]; ok {
-			for _, key := range keys {
+		if isSlice {
+			for _, key := range br.slices[idx] {
 				if match(key) {
 					bm.Add(br.id)
 					break
 				}
+			}
+		} else if key := br.keys[idx]; key != nil {
+			if match(key) {
+				bm.Add(br.id)
 			}
 		}
 	}

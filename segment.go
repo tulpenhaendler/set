@@ -217,21 +217,41 @@ func (fi *fieldIndex) loadBitmap(idx uint32) *roaring64.Bitmap {
 	var end uint64
 	if idx+1 < fi.count {
 		nextOffPos := offPos + 8
+		if nextOffPos+8 > len(fi.roarData) {
+			return roaring64.New()
+		}
 		end = binary.LittleEndian.Uint64(fi.roarData[nextOffPos : nextOffPos+8])
 	} else {
 		end = uint64(len(fi.roarData))
 	}
 
-	if int(offset) >= len(fi.roarData) || int(end) > len(fi.roarData) {
+	if offset >= end || int(offset) >= len(fi.roarData) || int(end) > len(fi.roarData) {
 		return roaring64.New()
 	}
 
-	bm := roaring64.New()
-	r := readerPool.Get().(*bytes.Reader)
-	r.Reset(fi.roarData[offset:end])
-	bm.ReadFrom(r)
-	readerPool.Put(r)
+	bm := decodeBitmap(fi.roarData[offset:end])
+	if bm == nil {
+		return roaring64.New()
+	}
 	fi.cache.Add(idx, bm)
+	return bm
+}
+
+// decodeBitmap deserializes a roaring bitmap, returning nil on corrupted data.
+func decodeBitmap(data []byte) (bm *roaring64.Bitmap) {
+	defer func() {
+		if recover() != nil {
+			bm = nil
+		}
+	}()
+	bm = roaring64.New()
+	r := readerPool.Get().(*bytes.Reader)
+	r.Reset(data)
+	if _, err := bm.ReadFrom(r); err != nil {
+		readerPool.Put(r)
+		return nil
+	}
+	readerPool.Put(r)
 	return bm
 }
 

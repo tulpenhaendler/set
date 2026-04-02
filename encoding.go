@@ -21,6 +21,19 @@ func EncodeKey(v uint64) []byte {
 	return buf
 }
 
+// EncodeKeyTo appends a length-prefixed big-endian encoding of v to dst.
+func EncodeKeyTo(dst []byte, v uint64) []byte {
+	if v == 0 {
+		return append(dst, 1, 0)
+	}
+	n := (bits.Len64(v) + 7) / 8
+	dst = append(dst, byte(n))
+	for i := n - 1; i >= 0; i-- {
+		dst = append(dst, byte(v>>(uint(i)*8)))
+	}
+	return dst
+}
+
 // DecodeKey decodes a length-prefixed big-endian byte slice back to uint64.
 func DecodeKey(b []byte) uint64 {
 	if len(b) < 2 {

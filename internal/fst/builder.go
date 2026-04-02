@@ -42,9 +42,10 @@ type Builder struct {
 	written int64
 
 	// For minimization: registry of frozen states.
-	registry map[string]int64 // serialized state → address
-	scratch  bytes.Buffer     // reused for node serialization
-	tmp      [binary.MaxVarintLen64]byte
+	registry  map[string]int64 // serialized state → address
+	scratch   bytes.Buffer     // reused for node serialization
+	tmp       [binary.MaxVarintLen64]byte
+	freeNodes []*builderNode // recycled nodes
 
 	// Build stack.
 	frontier []*builderNode
@@ -78,8 +79,7 @@ func NewBuilder(w io.Writer) *Builder {
 	binary.Write(&b.buf, binary.LittleEndian, uint64(0)) // num_keys placeholder
 	b.written = headerSize
 
-	// Start with a single root node in the frontier.
-	b.frontier = append(b.frontier, &builderNode{})
+	b.frontier = append(b.frontier, b.getNode())
 	return b
 }
 
@@ -99,7 +99,7 @@ func (b *Builder) Add(key []byte, value uint64) error {
 	b.freezeFrom(prefixLen + 1)
 
 	for i := len(b.frontier); i <= len(key); i++ {
-		b.frontier = append(b.frontier, &builderNode{})
+		b.frontier = append(b.frontier, b.getNode())
 	}
 
 	for i := prefixLen; i < len(key); i++ {
@@ -139,14 +139,31 @@ func (b *Builder) freezeFrom(level int) {
 				}
 			}
 		}
-		b.frontier[i] = &builderNode{}
+		b.putNode(b.frontier[i])
+		b.frontier[i] = b.getNode()
 	}
 	b.frontier = b.frontier[:level]
 	if level == 0 {
 		if len(b.frontier) == 0 {
-			b.frontier = append(b.frontier, &builderNode{})
+			b.frontier = append(b.frontier, b.getNode())
 		}
 	}
+}
+
+func (b *Builder) getNode() *builderNode {
+	if n := len(b.freeNodes); n > 0 {
+		node := b.freeNodes[n-1]
+		b.freeNodes = b.freeNodes[:n-1]
+		return node
+	}
+	return &builderNode{}
+}
+
+func (b *Builder) putNode(n *builderNode) {
+	n.transitions = n.transitions[:0]
+	n.isFinal = false
+	n.finalOutput = 0
+	b.freeNodes = append(b.freeNodes, n)
 }
 
 func (b *Builder) putUvarint(buf *bytes.Buffer, v uint64) {

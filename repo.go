@@ -1,6 +1,7 @@
 package set
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"os"
@@ -23,23 +24,54 @@ type Repo struct {
 	segments []*segment
 	nextSeg  int
 	buffer   []bufferedRecord
+
+	// Pre-computed field layout.
+	fieldMap map[string]int // field name → index (includes composites)
+	nFields  int            // len(schema.Fields)
+	nSlots   int            // nFields + len(schema.Composites)
 }
 
 type bufferedRecord struct {
 	id     uint64
-	fields map[string][]byte // field name → encoded key (one per String/Range/Bool/Enum/Bytes/BigInt)
-	slices map[string][][]byte // field name → encoded keys (for Slice fields)
+	keys   [][]byte    // indexed by field position; nil for slice fields
+	slices [][][]byte  // indexed by field position; nil for scalar fields
 }
 
 func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
+	nf := len(schema.Fields)
+	nc := len(schema.Composites)
+
+	fm := make(map[string]int, nf+nc)
+	for i, f := range schema.Fields {
+		fm[f.Name] = i
+	}
+	for j, c := range schema.Composites {
+		fm[compositeFieldName(c)] = nf + j
+	}
+
 	r := &Repo{
-		dir:    dir,
-		schema: schema,
-		dict:   d,
+		dir:      dir,
+		schema:   schema,
+		dict:     d,
+		fieldMap: fm,
+		nFields:  nf,
+		nSlots:   nf + nc,
 	}
 
 	// Load existing segments.
 	segDir := filepath.Join(dir, "segments")
+
+	// Recover from interrupted compaction: remove stale segments.
+	if marker, err := os.ReadFile(filepath.Join(segDir, ".compact_done")); err == nil {
+		for _, line := range bytes.Split(marker, []byte("\n")) {
+			name := string(bytes.TrimSpace(line))
+			if name != "" {
+				os.RemoveAll(filepath.Join(segDir, name))
+			}
+		}
+		os.Remove(filepath.Join(segDir, ".compact_done"))
+	}
+
 	entries, err := os.ReadDir(segDir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("fst: read segments dir: %w", err)
@@ -83,32 +115,33 @@ func (r *Repo) Index(id uint64, rec Record) error {
 
 	br := bufferedRecord{
 		id:     id,
-		fields: make(map[string][]byte),
-		slices: make(map[string][][]byte),
+		keys:   make([][]byte, r.nSlots),
+		slices: make([][][]byte, r.nFields),
 	}
 
-	for _, f := range r.schema.Fields {
+	for i, f := range r.schema.Fields {
 		v := rec[f.Name]
 		key, keys, err := r.encodeRecordField(f, v)
 		if err != nil {
 			return fmt.Errorf("fst: encode field %q: %w", f.Name, err)
 		}
 		if keys != nil {
-			br.slices[f.Name] = keys
+			br.slices[i] = keys
 		} else {
-			br.fields[f.Name] = key
+			br.keys[i] = key
 		}
 	}
 
-	// Build composite keys by concatenating component field encodings.
-	for _, c := range r.schema.Composites {
+	// Build composite keys.
+	for j, c := range r.schema.Composites {
 		var ck []byte
 		for _, name := range c.Fields {
-			if key, ok := br.fields[name]; ok {
+			idx := r.fieldMap[name]
+			if key := br.keys[idx]; key != nil {
 				ck = append(ck, key...)
 			}
 		}
-		br.fields[compositeFieldName(c)] = ck
+		br.keys[r.nFields+j] = ck
 	}
 
 	r.mu.Lock()
@@ -147,12 +180,18 @@ func (r *Repo) Flush() error {
 	sb := newSegmentBuilder(segDir, allFields(r.schema))
 
 	for _, br := range buf {
-		for name, key := range br.fields {
-			sb.add(name, key, br.id)
+		for i, f := range r.schema.Fields {
+			if br.slices[i] != nil {
+				for _, key := range br.slices[i] {
+					sb.add(f.Name, key, br.id)
+				}
+			} else if br.keys[i] != nil {
+				sb.add(f.Name, br.keys[i], br.id)
+			}
 		}
-		for name, keys := range br.slices {
-			for _, key := range keys {
-				sb.add(name, key, br.id)
+		for j, c := range r.schema.Composites {
+			if key := br.keys[r.nFields+j]; key != nil {
+				sb.add(compositeFieldName(c), key, br.id)
 			}
 		}
 	}
@@ -190,7 +229,6 @@ func (r *Repo) Compact() error {
 	allF := allFields(r.schema)
 	sb := newSegmentBuilder(segDir, allF)
 
-	// For each field (including composites), iterate all segments' FSTs and merge.
 	for _, f := range allF {
 		for _, seg := range segs {
 			fi := seg.fields[f.Name]
@@ -210,14 +248,29 @@ func (r *Repo) Compact() error {
 	}
 
 	if err := sb.build(); err != nil {
+		os.RemoveAll(segDir)
 		return fmt.Errorf("fst: compact build: %w", err)
 	}
 
 	fieldNames := allFieldNames(r.schema)
 	newSeg, err := openSegment(segDir, fieldNames)
 	if err != nil {
+		os.RemoveAll(segDir)
 		return fmt.Errorf("fst: compact open: %w", err)
 	}
+
+	// Write marker listing old segments to remove.
+	// If we crash after this, recovery cleans them up on next open.
+	segBase := filepath.Join(r.dir, "segments")
+	var marker []byte
+	for _, seg := range segs {
+		marker = append(marker, []byte(filepath.Base(seg.dir)+"\n")...)
+	}
+	markerPath := filepath.Join(segBase, ".compact_done")
+	if err := os.WriteFile(markerPath, marker, 0644); err != nil {
+		return fmt.Errorf("fst: write compact marker: %w", err)
+	}
+	syncDir(segBase)
 
 	// Swap segments.
 	r.mu.Lock()
@@ -225,13 +278,22 @@ func (r *Repo) Compact() error {
 	r.segments = []*segment{newSeg}
 	r.mu.Unlock()
 
-	// Clean up old segments.
+	// Clean up old segments and marker.
 	for _, seg := range oldSegs {
 		seg.close()
 		os.RemoveAll(seg.dir)
 	}
+	os.Remove(markerPath)
 
 	return nil
+}
+
+// syncDir fsyncs a directory to persist metadata changes.
+func syncDir(path string) {
+	if d, err := os.Open(path); err == nil {
+		d.Sync()
+		d.Close()
+	}
 }
 
 func (r *Repo) encodeRecordField(f Field, v any) (key []byte, keys [][]byte, err error) {
@@ -328,4 +390,3 @@ func allFieldNames(s Schema) []string {
 	}
 	return names
 }
-
