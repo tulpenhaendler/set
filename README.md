@@ -8,7 +8,7 @@ Given a schema of typed fields, `set` builds [FST](https://en.wikipedia.org/wiki
 
 Databases use B-trees, which are optimized for mutable data -- random inserts, updates, deletes. That flexibility costs: queries walk leaf pages row by row, and multi-column intersections require index merges.
 
-Blockchain data is immutable. By dropping the mutability requirement, `set` uses compressed bitmap indexes instead: an `And` of two predicates is a CPU-level bitwise AND over compact bitsets, not a merge join. The tradeoff is slower writes (~1.3x vs SQLite), which is fine when reads outnumber writes 1000:1.
+Blockchain data is immutable. By dropping the mutability requirement, `set` uses FST-backed inverted indexes with compressed bitmaps instead: an `And` of two predicates is a CPU-level bitwise AND over compact bitsets, not a merge join. FSTs are costly to build but compact and fast to query. The tradeoff is slower writes (~1.3x vs SQLite), which is acceptable when reads vastly outnumber writes.
 
 ### Benchmark: 500k Tezos transactions
 
