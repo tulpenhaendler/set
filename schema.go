@@ -36,7 +36,16 @@ type FieldType struct {
 	RangeEnc RangeEncoding
 	EnumVals []string
 	ByteSize int
+	StoredAs StoredKind // only for KindStored: range vs string
 }
+
+// StoredKind distinguishes numeric vs string stored fields.
+type StoredKind byte
+
+const (
+	StoredAsRange  StoredKind = iota // uses RangeEnc (Uint64BE, Int64BE, Timestamp)
+	StoredAsString                   // uses DictKey codec for encode/decode
+)
 
 type FieldKind byte
 
@@ -48,6 +57,7 @@ const (
 	KindEnum
 	KindBytes
 	KindBigInt
+	KindStored
 )
 
 type RangeEncoding byte
@@ -86,6 +96,20 @@ func BigInt() FieldType {
 	return FieldType{Kind: KindBigInt}
 }
 
+// Stored creates a stored (non-indexed) field type. Values are persisted
+// alongside indexed fields but do not produce FST/bitmap entries.
+// enc must be a RangeEncoding (for numeric types) or dict.KeyType (for strings).
+func Stored(enc any) FieldType {
+	switch e := enc.(type) {
+	case RangeEncoding:
+		return FieldType{Kind: KindStored, RangeEnc: e, StoredAs: StoredAsRange}
+	case dict.KeyType:
+		return FieldType{Kind: KindStored, DictKey: e, StoredAs: StoredAsString}
+	default:
+		panic(fmt.Sprintf("set.Stored: unsupported encoding type %T", enc))
+	}
+}
+
 // Hash returns a deterministic 16-char hex hash of the schema.
 // Fields are sorted by name so declaration order doesn't matter.
 func (s Schema) Hash() string {
@@ -108,6 +132,7 @@ func (s Schema) Hash() string {
 			h.Write([]byte{0}) // separator
 		}
 		h.Write([]byte{byte(f.Type.ByteSize >> 8), byte(f.Type.ByteSize)})
+		h.Write([]byte{byte(f.Type.StoredAs)})
 	}
 
 	// Include composites in hash.
@@ -205,8 +230,35 @@ func validateFieldValue(f Field, v any) error {
 		if _, ok := v.(*big.Int); !ok {
 			return fmt.Errorf("expected *big.Int, got %T", v)
 		}
+	case KindStored:
+		return validateStoredValue(f.Type, v)
 	default:
 		return fmt.Errorf("unknown field kind %d", f.Type.Kind)
+	}
+	return nil
+}
+
+func validateStoredValue(ft FieldType, v any) error {
+	switch ft.StoredAs {
+	case StoredAsRange:
+		switch ft.RangeEnc {
+		case Uint64BE:
+			if _, ok := v.(uint64); !ok {
+				return fmt.Errorf("expected uint64, got %T", v)
+			}
+		case Int64BE:
+			if _, ok := v.(int64); !ok {
+				return fmt.Errorf("expected int64, got %T", v)
+			}
+		case Timestamp:
+			if _, ok := v.(time.Time); !ok {
+				return fmt.Errorf("expected time.Time, got %T", v)
+			}
+		}
+	case StoredAsString:
+		if _, ok := v.(string); !ok {
+			return fmt.Errorf("expected string, got %T", v)
+		}
 	}
 	return nil
 }

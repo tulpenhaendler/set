@@ -1,8 +1,13 @@
 package set
 
 import (
+	"encoding/binary"
+	"fmt"
 	"math/big"
 	"math/bits"
+	"time"
+
+	"github.com/tulpenhaendler/dict/codec"
 )
 
 // EncodeKey encodes a uint64 as a length-prefixed big-endian byte slice.
@@ -151,4 +156,53 @@ func EncodeInt64Key(v int64) []byte {
 // DecodeInt64Key decodes an int64 from the flipped encoding.
 func DecodeInt64Key(b []byte) int64 {
 	return int64(DecodeKey(b) ^ (1 << 63))
+}
+
+// EncodeStoredValue encodes a Go value for a stored field.
+func EncodeStoredValue(ft FieldType, v any) ([]byte, error) {
+	switch ft.StoredAs {
+	case StoredAsRange:
+		var buf [8]byte
+		switch ft.RangeEnc {
+		case Uint64BE:
+			binary.BigEndian.PutUint64(buf[:], v.(uint64))
+		case Int64BE:
+			binary.BigEndian.PutUint64(buf[:], uint64(v.(int64)))
+		case Timestamp:
+			binary.BigEndian.PutUint64(buf[:], uint64(v.(time.Time).UnixNano()))
+		}
+		return buf[:], nil
+	case StoredAsString:
+		c := codec.Get(ft.DictKey)
+		if c == nil {
+			return []byte(v.(string)), nil
+		}
+		return c.Encode(v.(string))
+	}
+	return nil, fmt.Errorf("unknown stored kind %d", ft.StoredAs)
+}
+
+// DecodeStoredValue decodes bytes back to the Go value for a stored field.
+func DecodeStoredValue(ft FieldType, b []byte) (any, error) {
+	switch ft.StoredAs {
+	case StoredAsRange:
+		if len(b) < 8 {
+			return nil, fmt.Errorf("stored value too short: %d", len(b))
+		}
+		switch ft.RangeEnc {
+		case Uint64BE:
+			return binary.BigEndian.Uint64(b), nil
+		case Int64BE:
+			return int64(binary.BigEndian.Uint64(b)), nil
+		case Timestamp:
+			return time.Unix(0, int64(binary.BigEndian.Uint64(b))), nil
+		}
+	case StoredAsString:
+		c := codec.Get(ft.DictKey)
+		if c == nil {
+			return string(b), nil
+		}
+		return c.Decode(b)
+	}
+	return nil, fmt.Errorf("unknown stored kind %d", ft.StoredAs)
 }

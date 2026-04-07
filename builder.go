@@ -28,25 +28,42 @@ type fieldEntry struct {
 	recordID uint64
 }
 
+// storedBuffer accumulates (record_id, encoded_value) pairs for one stored field.
+type storedBuffer struct {
+	entries []storedEntry
+}
+
+type storedEntry struct {
+	recordID uint64
+	value    []byte
+}
+
 // segmentBuilder builds a segment directory from buffered field data.
 type segmentBuilder struct {
-	dir    string
-	fields []Field
-	bufs   map[string]*fieldBuffer
-	arena  []byte             // shared backing store for key copies
-	allIDs *roaring64.Bitmap  // all record IDs for Not() support
+	dir        string
+	fields     []Field
+	bufs       map[string]*fieldBuffer
+	storedBufs map[string]*storedBuffer
+	arena      []byte             // shared backing store for key copies
+	allIDs     *roaring64.Bitmap  // all record IDs for Not() support
 }
 
 func newSegmentBuilder(dir string, fields []Field) *segmentBuilder {
 	bufs := make(map[string]*fieldBuffer, len(fields))
+	storedBufs := make(map[string]*storedBuffer)
 	for _, f := range fields {
-		bufs[f.Name] = &fieldBuffer{}
+		if f.Type.Kind == KindStored {
+			storedBufs[f.Name] = &storedBuffer{}
+		} else {
+			bufs[f.Name] = &fieldBuffer{}
+		}
 	}
 	return &segmentBuilder{
-		dir:    dir,
-		fields: fields,
-		bufs:   bufs,
-		allIDs: roaring64.New(),
+		dir:        dir,
+		fields:     fields,
+		bufs:       bufs,
+		storedBufs: storedBufs,
+		allIDs:     roaring64.New(),
 	}
 }
 
@@ -63,18 +80,43 @@ func (sb *segmentBuilder) add(fieldName string, key []byte, recordID uint64) {
 	}
 }
 
+func (sb *segmentBuilder) addStored(fieldName string, value []byte, recordID uint64) {
+	buf := sb.storedBufs[fieldName]
+	start := len(sb.arena)
+	sb.arena = append(sb.arena, value...)
+	buf.entries = append(buf.entries, storedEntry{
+		recordID: recordID,
+		value:    sb.arena[start:len(sb.arena):len(sb.arena)],
+	})
+	if sb.allIDs != nil {
+		sb.allIDs.Add(recordID)
+	}
+}
+
 func (sb *segmentBuilder) build() error {
 	if err := os.MkdirAll(sb.dir, 0755); err != nil {
 		return fmt.Errorf("fst: mkdir segment: %w", err)
 	}
 
 	for _, f := range sb.fields {
+		if f.Type.Kind == KindStored {
+			continue
+		}
 		buf := sb.bufs[f.Name]
 		if len(buf.entries) == 0 {
 			continue
 		}
 		if err := sb.buildField(f.Name, buf); err != nil {
 			return fmt.Errorf("fst: build field %q: %w", f.Name, err)
+		}
+	}
+
+	for name, buf := range sb.storedBufs {
+		if len(buf.entries) == 0 {
+			continue
+		}
+		if err := sb.buildStoredField(name, buf); err != nil {
+			return fmt.Errorf("fst: build stored field %q: %w", name, err)
 		}
 	}
 
@@ -235,6 +277,57 @@ func (sb *segmentBuilder) buildField(name string, buf *fieldBuffer) error {
 	}
 	if err := roarFile.Sync(); err != nil {
 		return fmt.Errorf("fsync roar: %w", err)
+	}
+	return nil
+}
+
+// buildStoredField writes a .stored file:
+//
+//	[count:4][record_ids: 8*count][offsets: 4*(count+1)][value_data...]
+//
+// record_ids are sorted ascending. offsets[i] is the byte offset into value_data
+// for entry i; offsets[count] marks the end.
+func (sb *segmentBuilder) buildStoredField(name string, buf *storedBuffer) error {
+	sort.Slice(buf.entries, func(i, j int) bool {
+		return buf.entries[i].recordID < buf.entries[j].recordID
+	})
+
+	count := uint32(len(buf.entries))
+	path := filepath.Join(sb.dir, name+".stored")
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 65536)
+
+	// count
+	binary.Write(w, binary.LittleEndian, count)
+
+	// record IDs
+	for _, e := range buf.entries {
+		binary.Write(w, binary.LittleEndian, e.recordID)
+	}
+
+	// offsets (count+1 entries)
+	var off uint32
+	for _, e := range buf.entries {
+		binary.Write(w, binary.LittleEndian, off)
+		off += uint32(len(e.value))
+	}
+	binary.Write(w, binary.LittleEndian, off) // sentinel
+
+	// value data
+	for _, e := range buf.entries {
+		w.Write(e.value)
+	}
+
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush stored: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync stored: %w", err)
 	}
 	return nil
 }

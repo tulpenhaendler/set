@@ -35,15 +35,18 @@ type Repo struct {
 	compactMu sync.Mutex
 
 	// Pre-computed field layout.
-	fieldMap map[string]int // field name → index (includes composites)
-	nFields  int            // len(schema.Fields)
-	nSlots   int            // nFields + len(schema.Composites)
+	fieldMap    map[string]int // field name → index (includes composites)
+	storedMap   map[string]int // stored field name → index in storedNames
+	storedNames []string       // ordered stored field names
+	nFields     int            // len(schema.Fields)
+	nSlots      int            // nFields + len(schema.Composites)
 }
 
 type bufferedRecord struct {
 	id     uint64
-	keys   [][]byte    // indexed by field position; nil for slice fields
+	keys   [][]byte    // indexed by field position; nil for slice/stored fields
 	slices [][][]byte  // indexed by field position; nil for scalar fields
+	stored [][]byte    // encoded stored values, indexed by stored field position
 }
 
 func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
@@ -58,13 +61,24 @@ func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
 		fm[compositeFieldName(c)] = nf + j
 	}
 
+	sm := make(map[string]int)
+	var sn []string
+	for _, f := range schema.Fields {
+		if f.Type.Kind == KindStored {
+			sm[f.Name] = len(sn)
+			sn = append(sn, f.Name)
+		}
+	}
+
 	r := &Repo{
-		dir:      dir,
-		schema:   schema,
-		dict:     d,
-		fieldMap: fm,
-		nFields:  nf,
-		nSlots:   nf + nc,
+		dir:         dir,
+		schema:      schema,
+		dict:        d,
+		fieldMap:    fm,
+		storedMap:   sm,
+		storedNames: sn,
+		nFields:     nf,
+		nSlots:      nf + nc,
 	}
 
 	// Load existing segments.
@@ -86,7 +100,7 @@ func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
 		return nil, fmt.Errorf("fst: read segments dir: %w", err)
 	}
 
-	fieldNames := allFieldNames(schema)
+	fieldNames := indexedFieldNames(schema)
 
 	var segNums []int
 	for _, e := range entries {
@@ -104,7 +118,7 @@ func openRepo(dir string, schema Schema, d *dict.Dict) (*Repo, error) {
 	loadedSegs := make(map[int]bool)
 	for _, n := range segNums {
 		segPath := filepath.Join(segDir, fmt.Sprintf("%06d", n))
-		seg, err := openSegment(segPath, fieldNames)
+		seg, err := openSegment(segPath, fieldNames, sn)
 		if err != nil {
 			// Skip corrupted segments rather than failing to open.
 			continue
@@ -139,9 +153,20 @@ func (r *Repo) Index(id uint64, rec Record) error {
 		keys:   make([][]byte, r.nSlots),
 		slices: make([][][]byte, r.nFields),
 	}
+	if len(r.storedNames) > 0 {
+		br.stored = make([][]byte, len(r.storedNames))
+	}
 
 	for i, f := range r.schema.Fields {
 		v := rec[f.Name]
+		if f.Type.Kind == KindStored {
+			enc, err := EncodeStoredValue(f.Type, v)
+			if err != nil {
+				return fmt.Errorf("fst: encode stored field %q: %w", f.Name, err)
+			}
+			br.stored[r.storedMap[f.Name]] = enc
+			continue
+		}
 		key, keys, err := r.encodeRecordField(f, v)
 		if err != nil {
 			return fmt.Errorf("fst: encode field %q: %w", f.Name, err)
@@ -207,6 +232,13 @@ func (r *Repo) Flush() error {
 
 	for _, br := range buf {
 		for i, f := range r.schema.Fields {
+			if f.Type.Kind == KindStored {
+				si := r.storedMap[f.Name]
+				if br.stored[si] != nil {
+					sb.addStored(f.Name, br.stored[si], br.id)
+				}
+				continue
+			}
 			if br.slices[i] != nil {
 				for _, key := range br.slices[i] {
 					sb.add(f.Name, key, br.id)
@@ -234,8 +266,7 @@ func (r *Repo) Flush() error {
 	syncDir(segDir)
 	syncDir(filepath.Dir(segDir))
 
-	fieldNames := allFieldNames(r.schema)
-	seg, err := openSegment(segDir, fieldNames)
+	seg, err := openSegment(segDir, indexedFieldNames(r.schema), r.storedNames)
 	if err != nil {
 		os.RemoveAll(segDir)
 		r.mu.Lock()
@@ -327,6 +358,9 @@ func (r *Repo) mergeSegments(toMerge []*segment) error {
 	sb := newSegmentBuilder(segDir, allF)
 
 	for _, f := range allF {
+		if f.Type.Kind == KindStored {
+			continue
+		}
 		for _, seg := range toMerge {
 			fi := seg.fields[f.Name]
 			if fi == nil {
@@ -343,13 +377,26 @@ func (r *Repo) mergeSegments(toMerge []*segment) error {
 		}
 	}
 
+	// Merge stored fields.
+	for _, name := range r.storedNames {
+		for _, seg := range toMerge {
+			sc := seg.stored[name]
+			if sc == nil {
+				continue
+			}
+			for i := uint32(0); i < sc.count; i++ {
+				id, val := sc.entry(i)
+				sb.addStored(name, val, id)
+			}
+		}
+	}
+
 	if err := sb.build(); err != nil {
 		os.RemoveAll(segDir)
 		return fmt.Errorf("fst: compact build: %w", err)
 	}
 
-	fieldNames := allFieldNames(r.schema)
-	newSeg, err := openSegment(segDir, fieldNames)
+	newSeg, err := openSegment(segDir, indexedFieldNames(r.schema), r.storedNames)
 	if err != nil {
 		os.RemoveAll(segDir)
 		return fmt.Errorf("fst: compact open: %w", err)
@@ -488,6 +535,20 @@ func allFieldNames(s Schema) []string {
 	names := make([]string, 0, len(s.Fields)+len(s.Composites))
 	for _, f := range s.Fields {
 		names = append(names, f.Name)
+	}
+	for _, c := range s.Composites {
+		names = append(names, compositeFieldName(c))
+	}
+	return names
+}
+
+// indexedFieldNames returns non-stored field names plus composite virtual fields.
+func indexedFieldNames(s Schema) []string {
+	var names []string
+	for _, f := range s.Fields {
+		if f.Type.Kind != KindStored {
+			names = append(names, f.Name)
+		}
 	}
 	for _, c := range s.Composites {
 		names = append(names, compositeFieldName(c))

@@ -37,7 +37,7 @@ func TestSegmentBuildAndQuery(t *testing.T) {
 	}
 
 	// Open the segment.
-	seg, err := openSegment(dir, []string{"color", "size"})
+	seg, err := openSegment(dir, []string{"color", "size"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

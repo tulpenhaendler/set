@@ -26,7 +26,18 @@ var readerPool = sync.Pool{
 type segment struct {
 	dir    string
 	fields map[string]*fieldIndex
+	stored map[string]*storedColumn
 	allIDs *roaring64.Bitmap // all record IDs in this segment
+}
+
+// storedColumn holds mmap'd data for a stored (non-indexed) field.
+// File format: [count:4][record_ids:8*count][offsets:4*(count+1)][values...]
+type storedColumn struct {
+	data    []byte // mmap'd file
+	count   uint32
+	idsOff  int // always 4
+	offsOff int // 4 + 8*count
+	valsOff int // 4 + 8*count + 4*(count+1)
 }
 
 // fieldIndex holds an FST + roaring bitmaps for one field.
@@ -38,7 +49,7 @@ type fieldIndex struct {
 	cache    *lru.Cache[uint32, *roaring64.Bitmap]
 }
 
-func openSegment(dir string, fieldNames []string) (*segment, error) {
+func openSegment(dir string, fieldNames []string, storedFieldNames []string) (*segment, error) {
 	// Verify checksum if present.
 	if err := verifySegmentChecksum(dir); err != nil {
 		return nil, fmt.Errorf("fst: checksum mismatch in %s: %w", filepath.Base(dir), err)
@@ -47,6 +58,7 @@ func openSegment(dir string, fieldNames []string) (*segment, error) {
 	seg := &segment{
 		dir:    dir,
 		fields: make(map[string]*fieldIndex),
+		stored: make(map[string]*storedColumn),
 	}
 
 	for _, name := range fieldNames {
@@ -57,6 +69,17 @@ func openSegment(dir string, fieldNames []string) (*segment, error) {
 		}
 		if fi != nil {
 			seg.fields[name] = fi
+		}
+	}
+
+	for _, name := range storedFieldNames {
+		sc, err := openStoredColumn(dir, name)
+		if err != nil {
+			seg.close()
+			return nil, fmt.Errorf("fst: open stored field %q: %w", name, err)
+		}
+		if sc != nil {
+			seg.stored[name] = sc
 		}
 	}
 
@@ -323,6 +346,79 @@ func decodeBitmap(data []byte) (bm *roaring64.Bitmap) {
 	return bm
 }
 
+func openStoredColumn(dir, name string) (*storedColumn, error) {
+	path := filepath.Join(dir, name+".stored")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+
+	data, err := mmapFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("mmap stored: %w", err)
+	}
+	if len(data) < 4 {
+		if data != nil {
+			syscall.Munmap(data)
+		}
+		return nil, nil
+	}
+
+	count := binary.LittleEndian.Uint32(data[:4])
+	idsOff := 4
+	offsOff := idsOff + int(count)*8
+	valsOff := offsOff + int(count+1)*4
+
+	if valsOff > len(data) {
+		syscall.Munmap(data)
+		return nil, fmt.Errorf("stored file truncated: need %d bytes, have %d", valsOff, len(data))
+	}
+
+	return &storedColumn{
+		data:    data,
+		count:   count,
+		idsOff:  idsOff,
+		offsOff: offsOff,
+		valsOff: valsOff,
+	}, nil
+}
+
+// lookup returns the stored value for a record ID via binary search.
+func (sc *storedColumn) lookup(recordID uint64) ([]byte, bool) {
+	lo, hi := 0, int(sc.count)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pos := sc.idsOff + mid*8
+		id := binary.LittleEndian.Uint64(sc.data[pos : pos+8])
+		if id < recordID {
+			lo = mid + 1
+		} else if id > recordID {
+			hi = mid
+		} else {
+			offPos := sc.offsOff + mid*4
+			start := binary.LittleEndian.Uint32(sc.data[offPos : offPos+4])
+			end := binary.LittleEndian.Uint32(sc.data[offPos+4 : offPos+8])
+			return sc.data[sc.valsOff+int(start) : sc.valsOff+int(end)], true
+		}
+	}
+	return nil, false
+}
+
+// entry returns the record ID and value at index i (for sequential access during compaction).
+func (sc *storedColumn) entry(i uint32) (uint64, []byte) {
+	idPos := sc.idsOff + int(i)*8
+	id := binary.LittleEndian.Uint64(sc.data[idPos : idPos+8])
+	offPos := sc.offsOff + int(i)*4
+	start := binary.LittleEndian.Uint32(sc.data[offPos : offPos+4])
+	end := binary.LittleEndian.Uint32(sc.data[offPos+4 : offPos+8])
+	return id, sc.data[sc.valsOff+int(start) : sc.valsOff+int(end)]
+}
+
+func (sc *storedColumn) close() {
+	if sc.data != nil {
+		syscall.Munmap(sc.data)
+	}
+}
+
 func (fi *fieldIndex) close() {
 	if fi.fstData != nil {
 		syscall.Munmap(fi.fstData)
@@ -343,5 +439,8 @@ func (s *segment) size() uint64 {
 func (s *segment) close() {
 	for _, fi := range s.fields {
 		fi.close()
+	}
+	for _, sc := range s.stored {
+		sc.close()
 	}
 }

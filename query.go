@@ -121,6 +121,8 @@ func Not(query Query) Query {
 }
 
 // Query executes a query and returns an iterator over matching record IDs.
+// The returned iterator supports Stored() for reading stored field values.
+// Stored field access requires that the iterator is closed before Compact() is called.
 func (r *Repo) Query(q Query) *Iterator {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -133,7 +135,18 @@ func (r *Repo) Query(q Query) *Iterator {
 		bm.Or(bufBm)
 	}
 
-	return newIterator(bm)
+	it := newIterator(bm)
+
+	// Attach stored-field context if the schema has stored fields.
+	if len(r.storedNames) > 0 {
+		it.segments = r.segments
+		it.buffer = r.buffer
+		it.flushing = r.flushing
+		it.schema = &r.schema
+		it.storedMap = r.storedMap
+	}
+
+	return it
 }
 
 // Count returns the number of matching records.
